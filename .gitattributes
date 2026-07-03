@@ -1,0 +1,14 @@
+# Normalize line endings. Text files: LF in the repo, native on checkout.
+* text=auto
+
+# Files that run *inside* the Linux container MUST be LF, even on Windows checkouts.
+*.sh   text eol=lf
+*.py   text eol=lf
+Dockerfile text eol=lf
+*.dockerfile text eol=lf
+docker-compose.yml text eol=lf
+
+
+*.csv  binary
+*.parquet binary
+*.png  binary
