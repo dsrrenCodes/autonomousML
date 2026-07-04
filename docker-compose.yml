@@ -21,6 +21,8 @@ services:
       - backend
     env_file:
       - .env
+    environment:
+      - BACKEND_URL=http://backend:8000
 
 
 # Base file: backend + frontend only. Ollama comes from OLLAMA_HOST in .env.
