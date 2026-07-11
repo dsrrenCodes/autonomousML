@@ -15,7 +15,7 @@ class AgentState(TypedDict):
     leaderboard_candidates_checked: list[str]
     judge_decision: dict                 # full JudgeDecision, see below — not just a verdict string
     retry_count: int
-    status: Literal["running", "retry", "accepted", "rejected"]
+    status: Literal["running", "retry", "accepted", "rejected", "exhausted"]
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 

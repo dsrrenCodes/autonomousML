@@ -23,6 +23,7 @@ class JudgeInput(BaseModel):
     candidates_checked: List[str]
 
 
+
 class LLMJudgeOutput(BaseModel):
     """Schema the LLM actually fills in."""
     verdict: Literal["accept", "retry", "reject"] = Field(
@@ -57,6 +58,7 @@ class LLMJudgeOutput(BaseModel):
             "provided to you. Do not invent new evidence — only quote or "
             "closely paraphrase what was given in critic_findings/detail. "
             "This is your audit trail."
+
         )
     )
 
@@ -69,15 +71,75 @@ class JudgeDecision(BaseModel):
     cited_evidence: List[str]
     rule_based_verdict: Literal["accept", "retry", "reject"]  # set by code/ its deterministic(not by llm)
     overrode_rules: bool                                       # set by code/(not by llm)
-
+    flagged_for_manual_review: Optional[bool]  =None        # set by code/(not by llm)
 
 
 def _rule_based_verdict(findings: list[CriticFinding]) -> str:
     """What the thresholds alone say — deterministic, no LLM."""
     return "reject" if any(not f.passed for f in findings) else "accept"
 
-#ADD FALLBACK DETERMISTIC RULE LATER ON in case parse fails
+
+def _apply_override_guardrail(decision: JudgeDecision, rule_verdict:str)-> JudgeDecision:
+    """This function accounts the case if Judge says 'yes' (without justification) but rules_verdict says 'no'
+    else if Judge gives Justification then flagged it out"""
+    de_escalation= decision.verdict == 'accept' and rule_verdict == 'reject'
+    if de_escalation and not decision.justification.strip():
+        decision.verdict= 'reject'
+        decision.selected_model=None 
+        decision.overrode_rules=False 
+        decision.justification =("Override blocked: accept past a hard-fail with no "
+                                  "justification. Reverted to rule-based reject.")
+    elif de_escalation:
+        decision.flagged_for_manual_review= True
+    return decision
+
+
+MAX_JUDGE_ATTEMPTS = 2  # DAY0 §9: one initial call + one reformat retry.
+
+
+def _fallback_decision(findings: list[CriticFinding], leaderboard: list[dict],
+                       rule_verdict: str, error: str) -> JudgeDecision:
+    """Deterministic fallback when the LLM never returns schema-valid output.
+
+    DAY0 §9: after the reformat retry also fails, drop the LLM verdict, take the
+    rule-based one, and flag it for manual review. The caller sets
+    status='exhausted' so the degraded path is visible to the Router/UI.
+    """
+    return JudgeDecision(
+        verdict=rule_verdict,
+        selected_model=(leaderboard[0]["model"]
+                        if rule_verdict == "accept" and leaderboard else None),
+        justification=(
+            f"LLM failed to return schema-valid output after {MAX_JUDGE_ATTEMPTS} "
+            f"attempts ({error}). Fell back to the deterministic rule-based "
+            "verdict; flagged for manual review."
+        ),
+        cited_evidence=([f.detail for f in findings if not f.passed]
+                        or ["No failing critic tests; rule-based verdict is accept."]),
+        rule_based_verdict=rule_verdict,
+        overrode_rules=False,
+        flagged_for_manual_review=True,
+    )
+
+
 def call_judge(state: AgentState) -> AgentState:
+    """Judge Agent node — the one place an LLM's output changes control flow.
+
+    Takes the Critic Node's findings and the top-3 AutoGluon leaderboard
+    candidates, asks the LLM (structured output, temperature=0) for a verdict,
+    selected model, justification, and cited evidence, then attaches two
+    code-computed fields the model is NOT trusted to self-report:
+
+        rule_based_verdict  what the thresholds alone would say (deterministic)
+        overrode_rules      True when the LLM disagreed with that baseline
+
+    Reads from state:  critic_findings, leaderboard, leaderboard_candidates_checked
+    Writes to state:   judge_decision (full JudgeDecision), status (routed on by
+                       the Router), leaderboard_candidates_checked.
+
+    Note: the override *guardrail* (block a silent de-escalation past a hard-fail;
+    flag/log allowed de-escalations) is Day-9 work and is not enforced here yet.
+    """
     findings = [CriticFinding(**f) for f in state['critic_findings']]
     judge_input = JudgeInput(
         critic_findings=findings,
@@ -85,8 +147,12 @@ def call_judge(state: AgentState) -> AgentState:
         candidates_checked=state['leaderboard_candidates_checked'],
     )
 
+    rule_verdict = _rule_based_verdict(findings)
+
     llm = load_llm()
-    structured_llm = llm.with_structured_output(LLMJudgeOutput)  
+    # include_raw=True: return {"raw","parsed","parsing_error"} instead of
+    # throwing, so the retry loop below can see the error and recover.
+    structured_llm = llm.with_structured_output(LLMJudgeOutput, include_raw=True)
 
     system_prompt = SystemMessage(
         "You are an expert ML engineer reviewing a training pipeline's "
@@ -112,14 +178,45 @@ def call_judge(state: AgentState) -> AgentState:
     4. cited_evidence: quote the specific critic finding details you relied on
     """)
 
-    llm_output = structured_llm.invoke([system_prompt, content])
+    # DAY0 §9 retry-with-reformat guard: try once, and if the output fails
+    # schema validation, re-prompt ONCE with the exact error appended.
+    messages = [system_prompt, content]
+    llm_output = None
+    last_error = None
+    for _ in range(MAX_JUDGE_ATTEMPTS):
+        result = structured_llm.invoke(messages)
+        if result["parsing_error"] is None and result["parsed"] is not None:
+            llm_output = result["parsed"]
+            break
+        last_error = result["parsing_error"]
+        # Show the model its own bad reply + the validation error, then retry.
+        messages = messages + [
+            result["raw"],
+            HumanMessage(
+                "Your previous reply did not match the required schema. "
+                f"Validation error:\n{last_error}\n\n"
+                "Reply again with ONLY a corrected object that satisfies the schema."
+            ),
+        ]
 
-    rule_verdict = _rule_based_verdict(findings)
+    # Both attempts failed to parse -> abandon the LLM, take the deterministic
+    # verdict, and mark the run exhausted so the Router/UI can flag it.
+    if llm_output is None:
+        fallback = _fallback_decision(
+            findings, judge_input.leaderboard_candidates, rule_verdict, str(last_error)
+        )
+        return {
+            "judge_decision": fallback.model_dump(),
+            "status": "exhausted",
+            "leaderboard_candidates_checked": [c["model"] for c in judge_input.leaderboard_candidates],
+        }
+
     output = JudgeDecision(
         **llm_output.model_dump(),
         rule_based_verdict=rule_verdict,
         overrode_rules=(llm_output.verdict != rule_verdict),
     )
+    output = _apply_override_guardrail(output, rule_verdict)
 
     verdict_to_status = {"accept": "accepted", "reject": "rejected", "retry": "retry"}
     return {
@@ -130,6 +227,8 @@ def call_judge(state: AgentState) -> AgentState:
 
 
 if __name__ == "__main__":
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252, which can't print ✅/❌
     from app.mocks.critic_findings import MOCK_CASES
     for name, case in MOCK_CASES.items():
         state = {
