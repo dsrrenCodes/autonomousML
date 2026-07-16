@@ -1,12 +1,47 @@
-from pydantic import Field
-from pydantic import BaseModel
-from app.state.agent_state import AgentState
-from typing import Literal
-from typing import TypedDict, Annotated,List, Sequence, Optional
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+"""
+Graph nodes — Data, Experiment, Critic, Judge. Sections below run in that
+pipeline order.
+
+    Data Node        deterministic. Inspects the raw CSV, writes a dtype
+                     report + edge-case flags to cleaned_data_summary.
+    Experiment Node  deterministic wrapper around AutoGluon. A library call,
+                     not a decision.
+    Critic Node      deterministic, unit-tested. Runs three fixed rule-based
+                     tests and writes exactly 3 CriticFinding dicts.
+    Judge Agent      the one place an LLM's output changes control flow.
+    Reporter Node    templated. Renders the finished run into report. No LLM.
+
+Importing this module pulls in AutoGluon (~0.5s on top of the pandas/sklearn
+this module already needs — they share most of the dependency tree). If that
+ever lands on a latency-sensitive path (e.g. FastAPI boot), move the
+autogluon import inside experiment_node() rather than splitting the file.
+
+Smoke tests for all four live in the __main__ block at the bottom:
+    python -m app.agents.nodes [data|experiment|critic|judge|all]
+
+Owners: Data/Experiment — Person B. Critic — Lokav. Judge — see call_judge.
+"""
+
+import builtins
+import contextlib
+import io
+from typing import List, Literal, Optional
+
+import numpy as np
+import pandas as pd
+from autogluon.tabular import TabularDataset, TabularPredictor
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
 from app.llm.llm import load_llm
+from app.state.agent_state import AgentState
 
 
+# ---------------------------------------------------------------------------
+# Shared schemas
+# ---------------------------------------------------------------------------
 
 class CriticFinding(BaseModel):
     test: str                       # "leakage" | "contamination" | "imbalance"
@@ -16,6 +51,47 @@ class CriticFinding(BaseModel):
     detail: str = ""                # human-readable, feeds cited_evidence
 
 
+class Remediation(BaseModel):
+    """A fix the pipeline can mechanically apply, then re-measure.
+
+    This is deliberately a CLOSED set, not free text. Every field here maps to
+    a real transform in _apply_remediation(); if a defect can't be expressed in
+    these fields, the pipeline cannot fix it and the Judge must reject rather
+    than retry. That constraint is what keeps 'retry' honest — the verdict can
+    only be returned when a concrete, executable action backs it.
+
+    Deliberately absent: any imbalance fix. Class weights / resampling change
+    what the model optimises rather than repairing the data, and check_imbalance
+    measures a LogisticRegression baseline instead of the AutoGluon models — so
+    the Critic couldn't tell whether such a fix worked. Imbalance is reported,
+    never remediated.
+    """
+    drop_columns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Feature columns to drop before refitting — use for a column the "
+            "leakage test flags as correlating near-perfectly with the target "
+            "(i.e. derived from the label). Name only columns given to you, "
+            "and NEVER the target column."
+        ),
+    )
+    dedupe: bool = Field(
+        default=False,
+        description=(
+            "Drop exact duplicate rows before refitting. Use when the "
+            "contamination test fails, since duplicates across the train/val "
+            "split make the validation score optimistic."
+        ),
+    )
+
+    def is_noop(self) -> bool:
+        """True if applying this would leave the data untouched."""
+        return not self.drop_columns and not self.dedupe
+
+    def key(self) -> str:
+        """Stable identity for 'have we already applied this?' comparisons."""
+        return f"drop={sorted(self.drop_columns)}|dedupe={self.dedupe}"
+
 
 class JudgeInput(BaseModel):
     critic_findings: List[CriticFinding]
@@ -23,16 +99,115 @@ class JudgeInput(BaseModel):
     candidates_checked: List[str]
 
 
+# ---------------------------------------------------------------------------
+# Dataset loading — the remediation boundary.
+#
+# Experiment and Critic MUST both read through _load_dataset(). If they diverge
+# about what "the data" is, the Critic certifies a dataset the model never
+# trained on, and every finding in the report is about the wrong thing.
+# ---------------------------------------------------------------------------
+
+# A restricted builtin subset for the REPL cleaning tool. This is a SPEED BUMP,
+# not a security sandbox — no import/open/eval/exec, but a determined snippet can
+# still escape via object internals. Acceptable because the code is generated by
+# our own trusted model against a local dataset, not by an adversary.
+_SAFE_BUILTIN_NAMES = [
+    "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float", "format",
+    "getattr", "hasattr", "int", "isinstance", "len", "list", "map", "max", "min",
+    "print", "range", "reversed", "round", "set", "sorted", "str", "sum", "tuple", "zip",
+]
+SAFE_BUILTINS = {n: getattr(builtins, n) for n in _SAFE_BUILTIN_NAMES}
+
+
+def _run_cleaning_code(code: str, df: pd.DataFrame) -> tuple[pd.DataFrame, str, Optional[str]]:
+    """Execute a cleaning snippet against `df` in a restricted namespace.
+
+    Shared by the live REPL tool (tools.run_cleaning_code) and history replay
+    (_apply_remediation), so what the agent sees while iterating is byte-for-byte
+    what gets replayed later. Returns (result_df, captured_stdout, error_or_None).
+
+    Restricted, NOT sandboxed (see SAFE_BUILTINS): only df/pd/np and a safe builtin
+    subset are exposed — no import/open/eval. `df` is the only persisted output, so
+    a snippet must leave its cleaned result in `df`; anything else is inspection.
+    """
+    ns = {"df": df, "pd": pd, "np": np}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exec(code, {"__builtins__": SAFE_BUILTINS}, ns)  # noqa: S102 - restricted, trusted model
+    except Exception as e:
+        return df, buf.getvalue(), f"{type(e).__name__}: {e}"
+    result = ns.get("df")
+    if not isinstance(result, pd.DataFrame):
+        return df, buf.getvalue(), ("After running, `df` is not a DataFrame — assign "
+                                    "your cleaned result back to `df`.")
+    return result, buf.getvalue(), None
+
+
+def _apply_remediation(df: pd.DataFrame, remediation: dict) -> pd.DataFrame:
+    """Apply one remediation-history entry to a DataFrame. Deterministic replay.
+
+    Two entry shapes, so both Judge paths share this replay:
+      * {"code": "..."}                  a REPL cleaning step (tool-agent path) —
+                                         re-exec'd via _run_cleaning_code.
+      * {"drop_columns": [...], "dedupe"} the closed-set directive (call_judge path).
+
+    A stored code step already passed the tool's runtime guard (ran clean, target
+    survived), so a replay error here means the data changed underneath us and is
+    surfaced loudly rather than silently swallowed. Closed-set drops silently
+    ignore absent columns — _validate_remediation already screened them.
+    """
+    if not remediation:
+        return df
+    if "code" in remediation:
+        new_df, _out, err = _run_cleaning_code(remediation["code"], df)
+        if err:
+            raise RuntimeError(f"Replaying a stored cleaning step failed: {err}")
+        return new_df
+    drop = [c for c in remediation.get("drop_columns", []) if c in df.columns]
+    if drop:
+        df = df.drop(columns=drop)
+    if remediation.get("dedupe"):
+        df = df.drop_duplicates(keep="first")
+    return df
+
+
+def _load_dataset(state: AgentState) -> pd.DataFrame:
+    """Read the CSV at dataset_path with EVERY remediation so far applied, in order.
+
+    On lap 1 the history is empty and this is a plain read_csv. On a retry it
+    returns the repaired data — the only reason the Critic's findings can differ
+    between laps, and so the only reason the loop can end anywhere other than the
+    retry bound.
+
+    Replays the whole history rather than a single 'active' directive, because
+    repairs must COMPOUND. If lap 1 drops a leaking column and lap 2 prescribes
+    a dedupe, applying only lap 2 would hand the model back the leaking column —
+    the loop would undo its own fix and oscillate. The Judge is told the findings
+    it sees are measured after all prior repairs, so the two must agree.
+
+    The dataset on disk is never mutated: remediation is replayed on every read,
+    so dataset_path always refers to exactly what the user uploaded.
+    """
+    df = pd.read_csv(state["dataset_path"])
+    for directive in (state.get("remediation_history") or []):
+        df = _apply_remediation(df, directive)
+    return df
+
 
 class LLMJudgeOutput(BaseModel):
     """Schema the LLM actually fills in."""
     verdict: Literal["accept", "retry", "reject"] = Field(
         description=(
             "Final decision on whether to promote a model to production. "
-            "'accept' = deploy the selected model. 'reject' = do not deploy; "
-            "pipeline must be redone (e.g. leakage, contamination). "
-            "'retry' = borderline case, worth re-running the experiment "
-            "with adjustments before deciding."
+            "'accept' = deploy the selected model. "
+            "'reject' = do not deploy, and the pipeline cannot fix this itself "
+            "(e.g. an imbalance problem, or a defect with no mechanical repair). "
+            "'retry' = a data defect you can name a concrete repair for — the "
+            "pipeline will DROP the columns you list and/or de-duplicate rows, "
+            "refit AutoGluon on the repaired data, re-run the critic tests, and "
+            "ask you again. Only use 'retry' if you also populate 'remediation' "
+            "with that repair; a retry you cannot describe a fix for is a reject."
         )
     )
     selected_model: Optional[str] = Field(
@@ -61,6 +236,16 @@ class LLMJudgeOutput(BaseModel):
 
         )
     )
+    remediation: Optional[Remediation] = Field(
+        default=None,
+        description=(
+            "REQUIRED when verdict is 'retry'; leave null otherwise. The repair "
+            "to apply before refitting. It must actually change the data and "
+            "must not repeat a repair already applied on an earlier lap — both "
+            "are rejected, because re-measuring unchanged data cannot yield a "
+            "different answer."
+        ),
+    )
 
 
 class JudgeDecision(BaseModel):
@@ -69,24 +254,398 @@ class JudgeDecision(BaseModel):
     selected_model: Optional[str]
     justification: str
     cited_evidence: List[str]
+    remediation: Optional[Remediation] = None                   # validated by code before it reaches state
     rule_based_verdict: Literal["accept", "retry", "reject"]  # set by code/ its deterministic(not by llm)
     overrode_rules: bool                                       # set by code/(not by llm)
     flagged_for_manual_review: Optional[bool]  =None        # set by code/(not by llm)
 
+
+# ---------------------------------------------------------------------------
+# Data Node — deterministic. No LLM call.
+#
+# Input:  raw CSV at dataset_path, target_column (post target-column-confirmation UI)
+# Output: cleaned_data_summary — dtype report + edge-case flags.
+#
+# This node does NOT rewrite the dataset to disk. It inspects the raw CSV and
+# writes a summary dict to AgentState["cleaned_data_summary"]; downstream
+# nodes (Experiment, Critic) still read the original dataset_path directly.
+# If real cleaning transforms are added later (imputation, dropping bad
+# columns, etc.), that's a deliberate scope expansion — not implied by the
+# current AgentState shape, which only has a dict, not a second file path.
+#
+# Edge cases flagged (Day-0 §1 / spec):
+#     wrong_dtype          column dtype looks inconsistent with its values
+#                          (e.g. numeric-looking column stored as object)
+#     single_class_target  target column has only 1 unique value —
+#                          nothing to predict, should halt the pipeline
+#     empty_column         column is 100% null
+#
+# Owner: Person B
+# ---------------------------------------------------------------------------
+
+def _detect_wrong_dtype_columns(df: pd.DataFrame) -> list[str]:
+    """
+    Flags object-dtype columns where every non-null value is actually
+    numeric (e.g. a column of "1", "2", "3" strings stored as object
+    instead of int/float — common CSV-parsing artifact).
+    """
+    flagged = []
+    for col in df.columns:
+        if df[col].dtype == "object":
+            non_null = df[col].dropna()
+            if non_null.empty:
+                continue
+            numeric_coerced = pd.to_numeric(non_null, errors="coerce")
+            if numeric_coerced.notna().all():
+                flagged.append(col)
+    return flagged
+
+
+def _detect_empty_columns(df: pd.DataFrame) -> list[str]:
+    """Columns that are 100% null."""
+    return [col for col in df.columns if df[col].isna().all()]
+
+
+def _detect_single_class_target(df: pd.DataFrame, target_column: str) -> bool:
+    """True if the target column has only one unique non-null value."""
+    if target_column not in df.columns:
+        return False
+    return df[target_column].dropna().nunique() <= 1
+
+
+def _dtype_report(df: pd.DataFrame) -> dict:
+    """Per-column dtype + null count + unique count, for the summary."""
+    report = {}
+    for col in df.columns:
+        report[col] = {
+            "dtype": str(df[col].dtype),
+            "null_count": int(df[col].isna().sum()),
+            "null_fraction": round(float(df[col].isna().mean()), 4),
+            "unique_count": int(df[col].nunique(dropna=True)),
+        }
+    return report
+
+
+def data_node(state: AgentState) -> AgentState:
+    """
+    LangGraph node entry point.
+
+    Input (from AgentState):  dataset_path, target_column
+    Output (to AgentState):   cleaned_data_summary — dict with:
+        n_rows, n_columns, dtype_report, wrong_dtype_columns,
+        empty_columns, single_class_target (bool), target_column,
+        halt_recommended (bool) — True if single_class_target or the
+        target column itself is empty; downstream nodes/Router should
+        treat this as a hard stop, not just a warning.
+    """
+    df = pd.read_csv(state["dataset_path"])
+    target_column = state["target_column"]
+
+    wrong_dtype_cols = _detect_wrong_dtype_columns(df)
+    empty_cols = _detect_empty_columns(df)
+    single_class = _detect_single_class_target(df, target_column)
+    target_missing = target_column not in df.columns
+    target_is_empty = target_column in empty_cols
+
+    halt_recommended = single_class or target_missing or target_is_empty
+
+    summary = {
+        "n_rows": len(df),
+        "n_columns": len(df.columns),
+        "target_column": target_column,
+        "dtype_report": _dtype_report(df),
+        "wrong_dtype_columns": wrong_dtype_cols,
+        "empty_columns": empty_cols,
+        "single_class_target": single_class,
+        "target_column_missing": target_missing,
+        "halt_recommended": halt_recommended,
+    }
+
+    return {"cleaned_data_summary": summary}
+
+
+# ---------------------------------------------------------------------------
+# Experiment Node — deterministic wrapper around AutoGluon. No LLM call.
+#
+# Fits a TabularPredictor on the dataset, packages the leaderboard into
+# AgentState-compatible shape. This is a library call, not a decision —
+# all judgment happens downstream in the Critic Node and Judge Agent.
+#
+# How AutoGluon infers problem type (documented here per Day-0 §3, verbatim
+# for EVIDENCE.md): it inspects the target column's values. Two unique
+# values -> binary classification. A small number of discrete values ->
+# multiclass. Many unique continuous values -> regression. Confirmed
+# against the Titanic 'Survived' column (0/1) -> correctly inferred as
+# 'binary' in every run tonight (see spike.py output history).
+#
+# Owner: Person B
+# ---------------------------------------------------------------------------
+
+def experiment_node(state: AgentState) -> AgentState:
+    """
+    LangGraph node entry point.
+
+    Input (from AgentState):  dataset_path, target_column, remediation
+    Output (to AgentState):   leaderboard — list[dict], ranked best-first,
+                               each entry carrying at minimum a 'model' key
+                               and a 'score_val' key (Judge/Critic depend on
+                               'model' specifically — see the _fallback_decision
+                               path below: leaderboard[0]["model"]).
+
+    Runs once per lap of the remediation cycle. Reads the data through
+    _load_dataset(), so on a retry it refits on the REPAIRED dataset — that
+    refit is the point of the lap, and the reason the resulting leaderboard is
+    comparable to the Critic's re-measurement of the same frame.
+
+    time_limit and presets are pinned per Day-0 §3 / §4 (sequential
+    AutoGluon -> Ollama execution, medium_quality for spike speed).
+    Do not relitigate these in isolation — they're a shared VRAM/timing
+    decision, not just an Experiment Node choice.
+    """
+    df = _load_dataset(state)
+    target_column = state["target_column"]
+
+    predictor = TabularPredictor(
+        label=target_column,
+        verbosity=0,
+    ).fit(
+        TabularDataset(df),
+        time_limit=60,
+        presets="medium_quality",
+    )
+
+    leaderboard_df = predictor.leaderboard(silent=True)
+    leaderboard = leaderboard_df.to_dict(orient="records")
+
+    return {
+        "leaderboard": leaderboard,
+        # Current truth for the Judge, AND one appended entry so the Reporter can
+        # still quote this lap's score after a later lap overwrites `leaderboard`.
+        # Top 3 only — that's all the report renders, and the full frame is heavy.
+        "leaderboard_history": [leaderboard[:3]],
+        "cleaned_data_summary": {
+            **state.get("cleaned_data_summary", {}),
+            "problem_type": predictor.problem_type,
+            "fit_time_seconds": round(sum(
+                row.get("fit_time", 0) for row in leaderboard
+            ), 2),
+            # Shape AFTER remediation, so a report on lap 2 doesn't quote the
+            # raw upload's dimensions for a model that never saw them.
+            "n_rows_fitted": len(df),
+            "n_columns_fitted": len(df.columns),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Critic Node — deterministic, unit-tested. No LLM call.
+#
+# Runs three fixed rule-based tests against the raw CSV at dataset_path, and
+# returns a list of exactly 3 CriticFinding dicts (leakage, contamination,
+# imbalance) — matching the CriticFinding schema above and
+# app/mocks/critic_findings.py's fixture shape exactly.
+#
+# Reads NOTHING from the Experiment Node: not the leaderboard, not the fitted
+# predictor. All three tests are properties of the dataset alone, so this node
+# has no data dependency on Experiment despite running after it in the graph.
+# Note the consequence for the imbalance test — see check_imbalance below.
+#
+# Thresholds (Day-0 §5 / mocks/critic_findings.py — single source of truth,
+# do not diverge from these without updating both places):
+#     leakage         max |feature-target correlation|   fails when > 0.95
+#     contamination   fraction of exact/near-dup rows    fails when > 0.01
+#     imbalance       minority-class recall              fails when < 0.50
+#
+# Owner: Lokav
+# ---------------------------------------------------------------------------
+
+LEAKAGE_THRESHOLD = 0.95
+CONTAMINATION_THRESHOLD = 0.01
+IMBALANCE_THRESHOLD = 0.50
+
+
+def _finding(test: str, threshold: float, measured_value: float,
+             passed: bool, detail: str = "") -> dict:
+    """One CriticFinding as a plain dict — matches the CriticFinding model above."""
+    return {
+        "test": test,
+        "threshold": threshold,
+        "measured_value": round(float(measured_value), 4),
+        "passed": bool(passed),
+        "detail": detail,
+    }
+
+
+def check_leakage(df: pd.DataFrame, target_column: str) -> dict:
+    """
+    Leakage test: max absolute correlation between any single feature and
+    the target. Only numeric features are checked directly; categorical
+    features are label-encoded first so they aren't silently skipped.
+    """
+    work_df = df.copy()
+
+    # Encode non-numeric columns so they're included in the correlation scan,
+    # not silently dropped by .corr(). This matters — a leaking categorical
+    # column should still be caught.
+    for col in work_df.columns:
+        if work_df[col].dtype == "object":
+            work_df[col] = work_df[col].astype("category").cat.codes
+
+    if target_column not in work_df.columns:
+        return _finding("leakage", LEAKAGE_THRESHOLD, 0.0, True,
+                         f"Target column '{target_column}' not found — skipped.")
+
+    correlations = work_df.corr(numeric_only=True)[target_column].drop(target_column, errors="ignore")
+    correlations = correlations.abs().dropna()
+
+    if correlations.empty:
+        return _finding("leakage", LEAKAGE_THRESHOLD, 0.0, True,
+                         "No numeric/encodable features to check against target.")
+
+    worst_col = correlations.idxmax()
+    worst_val = correlations.max()
+    passed = worst_val <= LEAKAGE_THRESHOLD
+
+    detail = (
+        f"Column '{worst_col}' correlates {worst_val:.4f} with target "
+        f"'{target_column}' — {'exceeds' if not passed else 'below'} the "
+        f"{LEAKAGE_THRESHOLD} ceiling."
+    )
+    return _finding("leakage", LEAKAGE_THRESHOLD, worst_val, passed, detail)
+
+
+def check_contamination(df: pd.DataFrame) -> dict:
+    """
+    Contamination test: fraction of exact-duplicate rows (hash-based).
+    Near-duplicate detection (fuzzy match) is a possible future upgrade —
+    Day-0 spec starts with exact/near-dup via hashing; this implementation
+    covers exact duplicates first since that's what the adversarial suite's
+    duplication case actually produces.
+    """
+    n_total = len(df)
+    if n_total == 0:
+        return _finding("contamination", CONTAMINATION_THRESHOLD, 0.0, True,
+                         "Empty dataset — nothing to check.")
+
+    n_duplicate_rows = df.duplicated(keep="first").sum()
+    fraction = n_duplicate_rows / n_total
+    passed = fraction <= CONTAMINATION_THRESHOLD
+
+    detail = (
+        f"{n_duplicate_rows} of {n_total} rows ({fraction:.2%}) are exact "
+        f"duplicates — {'exceeds' if not passed else 'below'} the "
+        f"{CONTAMINATION_THRESHOLD:.0%} ceiling."
+    )
+    return _finding("contamination", CONTAMINATION_THRESHOLD, fraction, passed, detail)
+
+
+def check_imbalance(df: pd.DataFrame, target_column: str) -> dict:
+    """
+    Imbalance test: minority-class recall using a quick baseline classifier
+    (LogisticRegression on numeric-encoded features), NOT AutoGluon's own
+    models — this is a fast, independent check, not a repeat of the
+    Experiment Node's work.
+
+    Binary classification only for now (matches the adversarial suite's
+    Survived 0/1 target). Multiclass support is a possible follow-up.
+    """
+    if target_column not in df.columns:
+        return _finding("imbalance", IMBALANCE_THRESHOLD, 1.0, True,
+                         f"Target column '{target_column}' not found — skipped.")
+
+    work_df = df.copy()
+    y = work_df[target_column]
+    X = work_df.drop(columns=[target_column])
+
+    for col in X.columns:
+        if X[col].dtype == "object":
+            X[col] = X[col].astype("category").cat.codes
+    X = X.fillna(X.median(numeric_only=True)).select_dtypes(include=[np.number])
+
+    if y.nunique() != 2:
+        return _finding("imbalance", IMBALANCE_THRESHOLD, 1.0, True,
+                         f"Target has {y.nunique()} classes — imbalance check "
+                         "currently only supports binary targets, skipped.")
+
+    minority_class = y.value_counts().idxmin()
+
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.3, random_state=42, stratify=y
+        )
+        clf = LogisticRegression(max_iter=1000)
+        clf.fit(X_train, y_train)
+        preds = clf.predict(X_test)
+
+        true_positives = ((preds == minority_class) & (y_test == minority_class)).sum()
+        actual_minority = (y_test == minority_class).sum()
+        recall = true_positives / actual_minority if actual_minority > 0 else 0.0
+    except Exception as e:
+        return _finding("imbalance", IMBALANCE_THRESHOLD, 0.0, False,
+                         f"Imbalance check failed to run ({e}) — treated as fail, "
+                         "needs manual review.")
+
+    passed = recall >= IMBALANCE_THRESHOLD
+    overall_accuracy = (preds == y_test).mean()
+
+    detail = (
+        f"Minority class '{minority_class}' recall {recall:.2f} while overall "
+        f"accuracy {overall_accuracy:.2f} — "
+        f"{'below floor, headline metric masks failure' if not passed else 'above floor'}."
+    )
+    return _finding("imbalance", IMBALANCE_THRESHOLD, recall, passed, detail)
+
+
+def critic_node(state: dict) -> dict:
+    """
+    LangGraph node entry point. Reads dataset_path + target_column from
+    AgentState, runs all three checks, writes critic_findings back.
+
+    Input (from AgentState): dataset_path, target_column, remediation
+    Output (to AgentState):  critic_findings — list[dict], always exactly
+                              3 entries (leakage, contamination, imbalance),
+                              in that fixed order.
+
+    Reads through _load_dataset(), the same call the Experiment Node makes, so
+    both see an identical frame. That identity is load-bearing: on a retry lap
+    the Critic must measure the repaired data the model was actually fit on,
+    otherwise it would certify the raw upload and the leakage finding would
+    still fire for a column that is no longer in the model's input.
+    """
+    df = _load_dataset(state)
+    target_column = state["target_column"]
+
+    findings = [
+        check_leakage(df, target_column),
+        check_contamination(df),
+        check_imbalance(df, target_column),
+    ]
+
+    # critic_findings is current truth (LastValue — the Judge must see the data
+    # as it is now). findings_history additionally appends, so the Reporter can
+    # still show that leakage failed on lap 1 after lap 2 repairs it away.
+    return {"critic_findings": findings, "findings_history": [findings]}
+
+
+# ---------------------------------------------------------------------------
+# Judge Agent — LLM-backed. The one place an LLM's output changes control flow.
+# ---------------------------------------------------------------------------
 
 def _rule_based_verdict(findings: list[CriticFinding]) -> str:
     """What the thresholds alone say — deterministic, no LLM."""
     return "reject" if any(not f.passed for f in findings) else "accept"
 
 
+#IMPORTANT when critic rejects but judge accepts (edge case so need to flag for manual review)
 def _apply_override_guardrail(decision: JudgeDecision, rule_verdict:str)-> JudgeDecision:
     """This function accounts the case if Judge says 'yes' (without justification) but rules_verdict says 'no'
     else if Judge gives Justification then flagged it out"""
     de_escalation= decision.verdict == 'accept' and rule_verdict == 'reject'
     if de_escalation and not decision.justification.strip():
+        # no justification and de-escalation case
         decision.verdict= 'reject'
-        decision.selected_model=None 
-        decision.overrode_rules=False 
+        decision.selected_model=None
+        decision.overrode_rules=False
         decision.justification =("Override blocked: accept past a hard-fail with no "
                                   "justification. Reverted to rule-based reject.")
     elif de_escalation:
@@ -94,7 +653,95 @@ def _apply_override_guardrail(decision: JudgeDecision, rule_verdict:str)-> Judge
     return decision
 
 
-MAX_JUDGE_ATTEMPTS = 2  # DAY0 §9: one initial call + one reformat retry.
+def _screen_remediation(
+    rem: Optional[Remediation], state: AgentState
+) -> tuple[bool, Optional[Remediation], Optional[str]]:
+    """Is this repair real, safe, and NEW? Returns (ok, cleaned_remediation, reason).
+
+    Screens a closed-set Remediation for the structured-output Judge
+    (_validate_remediation / call_judge). The tool-calling Judge does NOT use this —
+    its REPL runs arbitrary cleaning code, so it screens at runtime instead (target
+    survival, no-op detection) inside tools.run_cleaning_code.
+
+    Four ways a retry is not a retry:
+      * no directive at all               -> nothing to do
+      * names the target column           -> would delete the labels
+      * no-op after screening             -> hallucinated/absent columns, nothing changes
+      * repeats an applied directive      -> already in effect, data is identical
+
+    On success returns (True, cleaned, None) where `cleaned` has unknown/target
+    columns already screened out. On failure returns (False, None, reason) with a
+    human-readable reason the caller surfaces (downgrade-to-reject, or a
+    ToolMessage the agent can react to).
+    """
+    if rem is None:
+        return False, None, "no remediation directive was given"
+
+    summary = state.get("cleaned_data_summary") or {}
+    known_columns = set(summary.get("dtype_report") or {})
+    target = state.get("target_column")
+
+    if target is not None and target in rem.drop_columns:
+        return False, None, f"the remediation tried to drop the target column '{target}'"
+
+    # Screen the directive against the columns that actually exist. Unknown
+    # names are dropped rather than trusted — an LLM naming a column that
+    # isn't there would otherwise produce a silent no-op lap.
+    unknown = [c for c in rem.drop_columns if known_columns and c not in known_columns]
+    cleaned = Remediation(
+        drop_columns=[c for c in rem.drop_columns
+                      if c != target and (not known_columns or c in known_columns)],
+        dedupe=rem.dedupe,
+    )
+    if cleaned.is_noop():
+        reason = "the remediation would not change the data"
+        if unknown:
+            reason += f" (no such column(s): {unknown})"
+        return False, None, reason
+    if cleaned.key() in {Remediation(**h).key() for h in (state.get("remediation_history") or [])}:
+        return False, None, (f"the remediation repeats one already applied "
+                             f"({cleaned.key()}); re-measuring identical data cannot change the verdict")
+
+    return True, cleaned, None
+
+
+def _validate_remediation(decision: JudgeDecision, state: AgentState) -> JudgeDecision:
+    """Gate a 'retry' on the repair being real, safe, and NEW. Else downgrade to reject.
+
+    This is what makes the remediation cycle terminate. The Router's retry bound
+    (Day-0 §10) caps how many laps we burn, but it is a backstop, not a proof:
+    without this check the Judge could return 'retry' with an empty, bogus, or
+    already-applied directive, the data would come back unchanged, the Critic —
+    deterministic on a fixed frame — would emit identical findings, and the Judge
+    at temperature=0 would repeat itself until the bound killed the run. Every
+    lap costs a 60s AutoGluon refit, so a spin is expensive as well as useless.
+
+    Delegates the actual screening to _screen_remediation (shared with the
+    tool-calling Judge). On failure it downgrades to 'reject' and flags for manual
+    review: the Judge wanted another lap and we refused, which is exactly the kind
+    of disagreement EVIDENCE.md exists to record (Day-0 §8). The original reasoning
+    is preserved in the justification rather than overwritten.
+    """
+    if decision.verdict != "retry":
+        return decision
+
+    ok, cleaned, reason = _screen_remediation(decision.remediation, state)
+    if not ok:
+        decision.verdict = "reject"
+        decision.selected_model = None
+        decision.remediation = None
+        decision.flagged_for_manual_review = True
+        decision.justification = (
+            f"Retry blocked: {reason}. Downgraded to reject. "
+            f"The Judge's original reasoning was: {decision.justification}"
+        )
+        return decision
+
+    decision.remediation = cleaned
+    return decision
+
+
+MAX_JUDGE_ATTEMPTS = 2
 
 
 def _fallback_decision(findings: list[CriticFinding], leaderboard: list[dict],
@@ -133,25 +780,44 @@ def call_judge(state: AgentState) -> AgentState:
         rule_based_verdict  what the thresholds alone would say (deterministic)
         overrode_rules      True when the LLM disagreed with that baseline
 
-    Reads from state:  critic_findings, leaderboard, leaderboard_candidates_checked
-    Writes to state:   judge_decision (full JudgeDecision), status (routed on by
-                       the Router), leaderboard_candidates_checked.
+    On a 'retry' verdict it also prescribes a Remediation — the repair the
+    Experiment/Critic nodes apply on the next lap. That directive is screened by
+    _validate_remediation() before it reaches state; a retry whose repair is
+    absent, unsafe, or already applied is downgraded to reject, because an
+    unchanged dataset cannot produce a different answer.
 
-    Note: the override *guardrail* (block a silent de-escalation past a hard-fail;
-    flag/log allowed de-escalations) is Day-9 work and is not enforced here yet.
+    Reads from state:  critic_findings, leaderboard, leaderboard_candidates_checked,
+                       cleaned_data_summary (for the real column list),
+                       remediation_history, retry_count, target_column
+    Writes to state:   judge_decision (full JudgeDecision), status (routed on by
+                       the Router), leaderboard_candidates_checked, and — on a
+                       SURVIVING retry only — remediation_history (one directive,
+                       appended via reducer) and an incremented retry_count.
+
+    The increment is RETURNED, never assigned onto `state`: LangGraph applies a
+    node's return value to the channels and discards in-place mutation of the
+    input dict, so `state['retry_count'] += 1` would vanish and the bound would
+    never bind.
     """
     findings = [CriticFinding(**f) for f in state['critic_findings']]
     judge_input = JudgeInput(
         critic_findings=findings,
         leaderboard_candidates=state['leaderboard'][:3],
-        candidates_checked=state['leaderboard_candidates_checked'],
+        candidates_checked=state.get('leaderboard_candidates_checked', []),
     )
 
     rule_verdict = _rule_based_verdict(findings)
 
+    # The real column list, so the Judge names columns that exist rather than
+    # inventing one — a hallucinated name is a no-op lap. Falls back to the
+    # leaderboard-only view if the Data Node never ran.
+    summary = state.get("cleaned_data_summary") or {}
+    available_columns = [c for c in (summary.get("dtype_report") or {})
+                         if c != state.get("target_column")]
+    history = state.get("remediation_history") or []
+
     llm = load_llm()
-    # include_raw=True: return {"raw","parsed","parsing_error"} instead of
-    # throwing, so the retry loop below can see the error and recover.
+
     structured_llm = llm.with_structured_output(LLMJudgeOutput, include_raw=True)
 
     system_prompt = SystemMessage(
@@ -171,15 +837,26 @@ def call_judge(state: AgentState) -> AgentState:
     Candidates Already Rejected/Checked:
     {judge_input.candidates_checked}
 
+    Feature columns that exist in this dataset (a remediation may ONLY name
+    columns from this list; the target column '{state.get('target_column')}' is
+    not in it and must never be dropped):
+    {available_columns or '(unknown — the Data Node did not run)'}
+
+    Repairs already applied to this dataset on previous laps — they are ALREADY
+    in effect, and the findings above are measured AFTER them. Do not prescribe
+    any of these again; if the data still fails, a repeat cannot help:
+    {history or '(none — this is the first attempt, the data is as uploaded)'}
+
     Decide:
     1. verdict: accept / retry / reject
     2. selected_model: which candidate to promote (if accepting)
     3. justification: your reasoning, mandatory detail if overriding a failed test
     4. cited_evidence: quote the specific critic finding details you relied on
+    5. remediation: ONLY if verdict is 'retry' — the concrete repair to apply
+       before refitting. It must change the data and must not repeat anything
+       listed above. If no repair in scope would fix this, return 'reject'.
     """)
 
-    # DAY0 §9 retry-with-reformat guard: try once, and if the output fails
-    # schema validation, re-prompt ONCE with the exact error appended.
     messages = [system_prompt, content]
     llm_output = None
     last_error = None
@@ -216,19 +893,386 @@ def call_judge(state: AgentState) -> AgentState:
         rule_based_verdict=rule_verdict,
         overrode_rules=(llm_output.verdict != rule_verdict),
     )
+    # Order matters. The override guardrail can flip 'accept' -> 'reject'; the
+    # remediation gate can flip 'retry' -> 'reject'. Neither ever produces a
+    # 'retry', so the override check cannot resurrect a retry that the gate has
+    # already screened, and the gate cannot un-block an override.
     output = _apply_override_guardrail(output, rule_verdict)
+    output = _validate_remediation(output, state)
 
     verdict_to_status = {"accept": "accepted", "reject": "rejected", "retry": "retry"}
-    return {
+    update = {
         "judge_decision": output.model_dump(),
         "status": verdict_to_status[output.verdict],
         "leaderboard_candidates_checked": [c["model"] for c in judge_input.leaderboard_candidates],
     }
 
+    # Only a retry that SURVIVED _validate_remediation advances the counter and
+    # arms the next lap — so the bound is spent exclusively on laps that will
+    # actually re-measure changed data. A blocked retry is a reject by here, and
+    # falls through with the counter untouched.
+    if output.verdict == "retry":
+        update["retry_count"] = state.get("retry_count", 0) + 1
+        # One-element list: operator.add appends it. Returning the whole history
+        # would concatenate it onto itself. _load_dataset replays every entry, so
+        # this is the complete handoff to the next lap.
+        update["remediation_history"] = [output.remediation.model_dump()]
 
-if __name__ == "__main__":
-    import sys
-    sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252, which can't print ✅/❌
+    return update
+
+
+
+_VERDICT_LABEL = {"accept": "ACCEPT", "retry": "RETRY", "reject": "REJECT"}
+
+
+def _fmt_score(value) -> str:
+    """Leaderboard scores are floats, but never trust a dict you didn't build."""
+    return f"{value:.4f}" if isinstance(value, (int, float)) else str(value)
+
+
+def _fmt_repair(rem: dict) -> str:
+    """One remediation directive as a short human phrase."""
+    if rem.get("code"):
+        one_line = " ".join(rem["code"].split())
+        return f"ran `{one_line[:100]}{'…' if len(one_line) > 100 else ''}`"
+    parts = []
+    if rem.get("drop_columns"):
+        parts.append("dropped " + ", ".join(f"`{c}`" for c in rem["drop_columns"]))
+    if rem.get("dedupe"):
+        parts.append("de-duplicated rows")
+    return "; ".join(parts) or "_(no-op)_"
+
+
+def _lap_table(r: dict) -> list[str]:
+    """The before/after table — the single most important thing this run produces.
+
+    Only rendered when there WAS more than one lap. On a single-lap run it would
+    just restate the Critic Findings table below, and an empty "what we caught"
+    section on a clean dataset reads like a bug.
+
+    Pairing rule: remediation_history[i] is the repair the Judge prescribed after
+    lap i, which produced lap i+1. So a repair is only shown as applied if a lap
+    i+1 actually exists — a bound-hit run has a trailing directive that call_judge
+    appended before the Router refused the lap, and claiming it was applied would
+    be a lie.
+    """
+    laps = min(len(r["leaderboard_history"]), len(r["findings_history"]))
+    if laps < 2:
+        return []
+
+    lines = [
+        "## What This Caught",
+        "",
+        "| Lap | Data | Top model | score_val | Failing tests | Repair prescribed |",
+        "|-----|------|-----------|-----------|---------------|-------------------|",
+    ]
+    for i in range(laps):
+        board = r["leaderboard_history"][i]
+        top = board[0] if board else {}
+        fails = [f.get("test") for f in r["findings_history"][i]
+                 if not f.get("passed", True)]
+        repair = "–"
+        if i < len(r["remediation_history"]):
+            repair = _fmt_repair(r["remediation_history"][i])
+            if i + 1 >= laps:          # prescribed, but the Router refused the lap
+                repair += " _(refused — retry bound)_"
+        lines.append(
+            f"| {i + 1} | {'as uploaded' if i == 0 else 'repaired'} | "
+            f"{top.get('model', '–')} | {_fmt_score(top.get('score_val'))} | "
+            f"{', '.join(f'**{t}**' for t in fails) or '–'} | {repair} |"
+        )
+    lines.append("")
+
+    # The delta is the headline. Guard the arithmetic — score_val is a dict value
+    # we did not build, and a failed model can carry NaN.
+    first = (r["leaderboard_history"][0] or [{}])[0].get("score_val")
+    last = (r["leaderboard_history"][laps - 1] or [{}])[0].get("score_val")
+    first_fails = [f.get("test") for f in r["findings_history"][0]
+                   if not f.get("passed", True)]
+    if (isinstance(first, (int, float)) and isinstance(last, (int, float))
+            and first == first and last == last):      # NaN != NaN
+        direction = "fell" if last < first else "rose"
+        lines += [f"The headline validation score {direction} from **{first:.4f}** to "
+                  f"**{last:.4f}** ({last - first:+.4f}) once the data was repaired"
+                  + (f" — the original score was inflated by "
+                     f"{', '.join(first_fails)}." if first_fails else "."), ""]
+
+    # The measured evidence behind lap 1's failures. Without this the table names
+    # the test but not the number, and judge_decision.cited_evidence — which held
+    # it — was overwritten by the final lap's decision. This is the only surviving
+    # copy of what the Critic actually saw in the raw upload.
+    original_fails = [f for f in r["findings_history"][0] if not f.get("passed", True)]
+    if original_fails:
+        lines += ["Measured on the data as uploaded:", ""]
+        lines += [f"- **{f.get('test')}** — {f.get('detail')}" for f in original_fails]
+        lines += [""]
+    return lines
+
+
+def _render_markdown(r: dict) -> str:
+    """Render the report dict as markdown. Pure string work, no state reads."""
+    label = _VERDICT_LABEL.get(r["verdict"], str(r["verdict"]).upper())
+    selected = f" — `{r['selected_model']}`" if r["selected_model"] else ""
+
+    lines = [
+        "# ML Pipeline Audit Report",
+        "",
+        f"**Verdict:** {label}{selected}",
+        f"**Run status:** `{r['status']}`",
+        "",
+    ]
+
+    # Banners go above the fold — these are the whole reason this report exists.
+    if r["flagged_for_manual_review"]:
+        lines += ["> **FLAGGED FOR MANUAL REVIEW** — a human must sign this off "
+                  "before anything ships.", ""]
+    if r["overrode_rules"]:
+        lines += [f"> **The Judge overrode the rules.** Thresholds alone said "
+                  f"`{r['rule_based_verdict']}`; the Judge returned "
+                  f"`{r['verdict']}`. The justification below is mandatory "
+                  "reading, and this run belongs in overrides.md.", ""]
+    if r["status"] == "exhausted":
+        # Two very different failures share this status, and telling a reader the
+        # wrong one is worse than telling them nothing. _fallback_decision always
+        # emits the rule-based verdict, which is only ever accept/reject — never
+        # 'retry'. So a 'retry' verdict here can ONLY mean the Router hit the
+        # bound, and anything else means the LLM never parsed.
+        if r["verdict"] == "retry":
+            lines += ["> **Retry limit reached** — the Judge kept prescribing "
+                      "repairs without reaching a decision, and the run hit its "
+                      "retry bound. Nothing was promoted. The repairs it applied "
+                      "are listed below.", ""]
+        else:
+            lines += ["> **Degraded run** — the LLM never returned schema-valid "
+                      "output. The verdict below is the deterministic rule-based "
+                      "one, not the Judge's.", ""]
+
+    # Above the Justification: on a repaired run this is the only place the
+    # original defect still exists, and it is the reason the run mattered.
+    lines += _lap_table(r)
+
+    lines += ["## Justification", "", r["justification"] or "_(none given)_", ""]
+
+    lines += ["## Cited Evidence", ""]
+    lines += ([f"- {e}" for e in r["cited_evidence"]]
+              or ["_(none cited)_"])
+    lines += [""]
+
+    # What the agent actually DID, as opposed to what it concluded. On a clean
+    # run this is empty and the section says so — an absent section would read
+    # as "we forgot to log it" rather than "no repair was needed".
+    lines += ["## Repairs Applied", ""]
+    if r["remediation_history"]:
+        lines += [f"The findings above were measured *after* these "
+                  f"{len(r['remediation_history'])} repair(s), applied in order:", ""]
+        for i, rem in enumerate(r["remediation_history"], start=1):
+            if rem.get("code"):
+                # A REPL cleaning step — show the actual code, it IS the evidence.
+                lines.append(f"{i}. ran cleaning code:")
+                lines.append("")
+                lines.append("   ```python")
+                lines += ["   " + cl for cl in rem["code"].splitlines()]
+                lines.append("   ```")
+                continue
+            actions = []
+            if rem.get("drop_columns"):
+                actions.append("dropped " + ", ".join(f"`{c}`" for c in rem["drop_columns"]))
+            if rem.get("dedupe"):
+                actions.append("de-duplicated rows")
+            lines.append(f"{i}. {'; '.join(actions) or '_(no-op)_'}")
+    else:
+        lines += ["_(none — the data was evaluated exactly as uploaded)_"]
+    lines += [""]
+
+    lines += ["## Critic Findings", ""]
+    if r["critic_findings"]:
+        lines += ["| Test | Result | Measured | Threshold |",
+                  "|------|--------|----------|-----------|"]
+        for f in r["critic_findings"]:
+            mark = "PASS" if f.get("passed") else "**FAIL**"
+            lines.append(f"| {f.get('test')} | {mark} | "
+                         f"{f.get('measured_value')} | {f.get('threshold')} |")
+        lines += [""]
+        for f in r["critic_findings"]:
+            if f.get("detail"):
+                lines.append(f"- **{f.get('test')}** — {f['detail']}")
+    else:
+        lines += ["_(no findings — the Critic Node did not run)_"]
+    lines += [""]
+
+    lines += ["## Leaderboard (top 3)", ""]
+    if r["leaderboard_top"]:
+        lines += ["| Rank | Model | score_val |", "|------|-------|-----------|"]
+        for i, row in enumerate(r["leaderboard_top"], start=1):
+            lines.append(f"| {i} | {row.get('model')} | "
+                         f"{_fmt_score(row.get('score_val'))} |")
+    else:
+        lines += ["_(no leaderboard — the Experiment Node did not run)_"]
+    lines += [""]
+
+    d = r["dataset"]
+    lines += [
+        "## Dataset",
+        "",
+        f"- target column: `{d['target_column']}`",
+        f"- shape: {d['n_rows']} rows x {d['n_columns']} columns",
+        f"- problem type: {d['problem_type']}",
+        f"- AutoGluon fit time: {d['fit_time_seconds']}s",
+    ]
+    if d["halt_recommended"]:
+        lines.append("- **halt_recommended: True** — the Data Node flagged this "
+                     "dataset as unfit to train on.")
+    lines += [""]
+
+    return "\n".join(lines)
+
+
+def reporter_node(state: AgentState) -> AgentState:
+    """
+    LangGraph node entry point — terminal (reporter -> END).
+
+    Input (from AgentState):  judge_decision, critic_findings, leaderboard,
+                              cleaned_data_summary, status
+    Output (to AgentState):   report — the flattened decision record plus a
+                              'markdown' key rendering the whole run.
+
+    Every read is a .get() with a default. That is deliberate, not defensive
+    padding: a run that fell over (status='exhausted', or a halt before the
+    Experiment Node ever produced a leaderboard) is exactly when you most
+    want a report, so this node must never be the thing that raises.
+    """
+    decision = state.get("judge_decision") or {}
+    findings = state.get("critic_findings") or []
+    leaderboard = state.get("leaderboard") or []
+    summary = state.get("cleaned_data_summary") or {}
+
+    # Reaching the Reporter with status='retry' can only mean the Router refused
+    # another lap (it routes 'retry' straight back to the Experiment Node while
+    # the bound allows it), so this run is retry-exhausted. The Router itself
+    # can't record that — a routing function returns an edge label and any state
+    # it writes is discarded — so the coercion lands here. Day-0 §10's "define
+    # the UI state for exhaustion" is this line plus the banner split above.
+    status = state.get("status")
+    if status == "retry":
+        status = "exhausted"
+
+    report = {
+        "status": status,
+        "verdict": decision.get("verdict"),
+        "selected_model": decision.get("selected_model"),
+        "rule_based_verdict": decision.get("rule_based_verdict"),
+        "overrode_rules": bool(decision.get("overrode_rules")),
+        "flagged_for_manual_review": bool(decision.get("flagged_for_manual_review")),
+        "justification": decision.get("justification", ""),
+        "cited_evidence": decision.get("cited_evidence", []),
+        "failing_tests": [f["test"] for f in findings if not f.get("passed", True)],
+        "critic_findings": findings,
+        "leaderboard_top": leaderboard[:3],
+        "remediation_history": state.get("remediation_history") or [],
+        "retry_count": state.get("retry_count", 0),
+        "findings_history": state.get("findings_history") or [],
+        "leaderboard_history": state.get("leaderboard_history") or [],
+        "dataset": {
+            "target_column": summary.get("target_column"),
+            "n_rows": summary.get("n_rows"),
+            "n_columns": summary.get("n_columns"),
+            "problem_type": summary.get("problem_type"),
+            "fit_time_seconds": summary.get("fit_time_seconds"),
+            "halt_recommended": summary.get("halt_recommended"),
+        },
+    }
+    report["markdown"] = _render_markdown(report)
+
+    return {"report": report}
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests — python -m app.agents.nodes [data|experiment|critic|judge|reporter|all]
+#
+# Note: 'experiment' actually fits models (60s time_limit per case), so it
+# takes minutes where the others are near-instant. 'judge' needs Ollama up.
+# ---------------------------------------------------------------------------
+
+def _smoke_data():
+    from pathlib import Path
+
+    DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "adversarial_suite"
+
+    test_cases = {
+        "clean_1": ("titanic_clean_1.csv", "Survived"),
+        "leakage": ("titanic_leakage.csv", "Survived"),
+        "duplicates": ("titanic_duplicates.csv", "Survived"),
+        "imbalance": ("titanic_imbalance.csv", "Survived"),
+        "prompt_injection": ("titanic_prompt_injection.csv", "Survived"),
+    }
+
+    for name, (filename, target) in test_cases.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            print(f"{name:18s} SKIPPED — file not found at {path}")
+            continue
+        result = data_node({"dataset_path": str(path), "target_column": target})
+        s = result["cleaned_data_summary"]
+        print(f"\n{name:18s} rows={s['n_rows']} cols={s['n_columns']} "
+              f"halt_recommended={s['halt_recommended']}")
+        if s["wrong_dtype_columns"]:
+            print(f"  wrong_dtype_columns: {s['wrong_dtype_columns']}")
+        if s["empty_columns"]:
+            print(f"  empty_columns: {s['empty_columns']}")
+        if s["single_class_target"]:
+            print(f"  single_class_target: True")
+
+
+def _smoke_experiment():
+    from pathlib import Path
+
+    DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "adversarial_suite"
+
+    test_cases = {
+        "clean_1": ("titanic_clean_1.csv", "Survived"),
+        "leakage": ("titanic_leakage.csv", "Survived"),
+        "duplicates": ("titanic_duplicates.csv", "Survived"),
+        "imbalance": ("titanic_imbalance.csv", "Survived"),
+    }
+
+    for name, (filename, target) in test_cases.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            print(f"{name:12s} SKIPPED — file not found at {path}")
+            continue
+        result = experiment_node({"dataset_path": str(path), "target_column": target})
+        top = result["leaderboard"][0]
+        print(f"{name:12s} problem_type={result['cleaned_data_summary']['problem_type']:8s} "
+              f"top_model={top['model']:20s} score_val={top['score_val']:.4f}")
+
+
+def _smoke_critic():
+    # Smoke test against the real adversarial suite built tonight.
+    from pathlib import Path
+
+    DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "adversarial_suite"
+
+    test_cases = {
+        "clean_1": ("titanic_clean_1.csv", "Survived"),
+        "leakage": ("titanic_leakage.csv", "Survived"),
+        "duplicates": ("titanic_duplicates.csv", "Survived"),
+        "imbalance": ("titanic_imbalance.csv", "Survived"),
+    }
+
+    for name, (filename, target) in test_cases.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            print(f"{name:12s} SKIPPED — file not found at {path}")
+            continue
+        result = critic_node({"dataset_path": str(path), "target_column": target})
+        fails = [f["test"] for f in result["critic_findings"] if not f["passed"]]
+        print(f"\n{name:12s} failing_tests={fails or '-'}")
+        for f in result["critic_findings"]:
+            mark = "PASS" if f["passed"] else "FAIL"
+            print(f"  [{mark}] {f['test']:15s} measured={f['measured_value']:<8} {f['detail']}")
+
+
+def _smoke_judge():
     from app.mocks.critic_findings import MOCK_CASES
     for name, case in MOCK_CASES.items():
         state = {
@@ -244,5 +1288,90 @@ if __name__ == "__main__":
         print(f"{mark} {name}: expected={expected} got_rule={actual} llm_verdict={decision['verdict']}")
 
 
-    
-    
+def _smoke_reporter():
+    """
+    Renders the three states worth eyeballing. Uses the Day-8 mock findings
+    plus hand-built judge_decisions — no Ollama, no AutoGluon, so this runs
+    instantly and stays runnable when neither is up.
+    """
+    from app.mocks.critic_findings import MOCK_CASES
+
+    clean, leaky = MOCK_CASES["titanic_clean"], MOCK_CASES["leakage"]
+
+    scenarios = {
+        # Ordinary accept — no banners should fire.
+        "accept": (clean, "accepted", {
+            "verdict": "accept", "selected_model": "WeightedEnsemble_L2",
+            "justification": "All three critic tests pass; top model is a "
+                             "reasonable margin above the rest.",
+            "cited_evidence": [clean["critic_findings"][0]["detail"]],
+            "rule_based_verdict": "accept", "overrode_rules": False,
+            "flagged_for_manual_review": None,
+        }),
+        # De-escalation past a hard-fail — override + manual-review banners.
+        "override_flagged": (leaky, "accepted", {
+            "verdict": "accept", "selected_model": "CatBoost",
+            "justification": "Accepting the #4 candidate: the top three are "
+                             "inflated by the leaking column, CatBoost is not.",
+            "cited_evidence": [leaky["critic_findings"][0]["detail"]],
+            "rule_based_verdict": "reject", "overrode_rules": True,
+            "flagged_for_manual_review": True,
+        }),
+        # LLM never parsed — degraded-run banner.
+        "exhausted": (leaky, "exhausted", {
+            "verdict": "reject", "selected_model": None,
+            "justification": "LLM failed to return schema-valid output after 2 "
+                             "attempts. Fell back to the rule-based verdict.",
+            "cited_evidence": [leaky["critic_findings"][0]["detail"]],
+            "rule_based_verdict": "reject", "overrode_rules": False,
+            "flagged_for_manual_review": True,
+        }),
+    }
+
+    for name, (case, status, decision) in scenarios.items():
+        state = {
+            "status": status,
+            "judge_decision": decision,
+            "critic_findings": case["critic_findings"],
+            "leaderboard": case["leaderboard"],
+            "cleaned_data_summary": {
+                "target_column": "Survived", "n_rows": 891, "n_columns": 12,
+                "problem_type": "binary", "fit_time_seconds": 41.7,
+                "halt_recommended": False,
+            },
+        }
+        report = reporter_node(state)["report"]
+        print(f"\n{'-' * 70}\nscenario: {name}  (failing_tests={report['failing_tests'] or '-'})\n{'-' * 70}")
+        print(report["markdown"])
+
+    # Partial state — a run that died before Experiment/Critic ever ran.
+    # The Reporter must still produce a report rather than raise.
+    empty = reporter_node({"status": "exhausted"})["report"]
+    print(f"\n{'-' * 70}\nscenario: empty_state (must not raise)\n{'-' * 70}")
+    print(empty["markdown"])
+
+
+if __name__ == "__main__":
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows consoles default to cp1252, which can't print ✅/❌
+
+    SMOKE_TESTS = {
+        "data": _smoke_data,
+        "experiment": _smoke_experiment,
+        "critic": _smoke_critic,
+        "judge": _smoke_judge,
+        "reporter": _smoke_reporter,
+    }
+    which = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    if which == "all":
+        to_run = SMOKE_TESTS.items()
+    elif which in SMOKE_TESTS:
+        to_run = [(which, SMOKE_TESTS[which])]
+    else:
+        sys.exit(f"Unknown smoke test '{which}'. Pick one of: "
+                 f"{', '.join(SMOKE_TESTS)}, all")
+
+    for name, smoke_test in to_run:
+        print(f"\n{'=' * 30} {name} {'=' * 30}")
+        smoke_test()
