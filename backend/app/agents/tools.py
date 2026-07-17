@@ -7,7 +7,6 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-from app.agents.edges import MAX_RETRIES
 from app.agents.nodes import (
     CriticFinding,
     JudgeDecision,
@@ -18,6 +17,12 @@ from app.agents.nodes import (
     critic_node,
     experiment_node,
 )
+
+# The refit bound (Day-0 §10): the most AutoGluon refits refit_and_recritique will
+# allow per run before it forces the agent to decide. State may override it via
+# `max_retries`; this is the fallback. Defined HERE, not in edges/graph — those
+# import tools, so importing back from them would be a circular import.
+MAX_RETRIES = 2
 
 
 def _findings_from(state: dict) -> List[CriticFinding]:
@@ -54,7 +59,7 @@ def _summarize_refit(findings: List[dict], leaderboard: List[dict]) -> str:
 @tool
 def run_cleaning_code(
     code: str,
-    state: Annotated[dict, InjectedState],
+    state: Annotated[dict, InjectedState], 
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """Run Python against the live training DataFrame `df` and see the real result.
@@ -78,11 +83,13 @@ def run_cleaning_code(
     out = out.rstrip()
     head = (out + "\n") if out else ""
 
+    #if error
     if err:
         return Command(update={"messages": [ToolMessage(
             f"{head}ERROR: {err}\nThe data was NOT changed. Fix your code and try again.",
             tool_call_id=tool_call_id)]})
 
+    #nothing has changed. do nothing. just return the state unchanged
     if new_df.equals(df):
         return Command(update={"messages": [ToolMessage(
             f"{head}--- df unchanged (inspection only) ---\n{_df_preview(new_df)}",
@@ -94,13 +101,14 @@ def run_cleaning_code(
             f"{head}REJECTED: your code removed the target column '{target}'. The "
             "pipeline cannot train without it — df was NOT changed.",
             tool_call_id=tool_call_id)]})
+    #cannot classify with 1 target class
     if new_df[target].dropna().nunique() < 2:
         return Command(update={"messages": [ToolMessage(
             f"{head}REJECTED: after your code the target '{target}' has fewer than 2 "
             "classes — df was NOT changed.", tool_call_id=tool_call_id)]})
-
+    #otherwise its a real and valid change, so save it
     return Command(update={
-        "remediation_history": [{"code": code}],    # one-elem, operator.add replay
+        "remediation_history": [{"code": code}],   
         "messages": [ToolMessage(
             f"{head}--- df after your code (SAVED as a cleaning step) ---\n"
             f"{_df_preview(new_df)}\nCall refit_and_recritique when ready to re-check, "

@@ -9,6 +9,11 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      # Live code. Mount the SUBDIR (/app/app), never /app itself: the image builds
+      # .venv, pyproject.toml and uv.lock into /app, and a bind mount there would
+      # shadow all three and break `uv run`.
+      - ./backend/app:/app/app
   frontend:
     build:
       context: .
@@ -23,6 +28,12 @@ services:
       - .env
     environment:
       - BACKEND_URL=http://backend:8000
+    volumes:
+      # This dockerfile does `COPY frontend/app .`, so the code sits at /app next to
+      # .venv + pyproject.toml. Mounting ./frontend/app:/app would hide those and
+      # break `uv run`, so mount the one source file instead. Add a line here if
+      # frontend/app grows more files.
+      - ./frontend/app/streamlit_app.py:/app/streamlit_app.py
 
 
 # Base file: backend + frontend only. Ollama comes from OLLAMA_HOST in .env.
