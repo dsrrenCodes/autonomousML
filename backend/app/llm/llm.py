@@ -1,12 +1,13 @@
 import os
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
 def load_llm():
-    llm = ChatOllama(
-    model=os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
-    base_url=os.getenv("OLLAMA_HOST", "http://ollama:11434"),
+    llm = ChatOpenAI(
+    model=os.getenv("AGNES_MODEL","agnes-2.0-flash"),
+    api_key=os.getenv("AGNES_API_KEY"),
+    base_url=os.getenv("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1"),
     temperature=0)
     return llm

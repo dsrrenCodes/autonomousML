@@ -32,10 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # backend/ on path
 
-from app.agents.data_node import data_node
-from app.agents.experiment_node import experiment_node
-from app.agents.critic_node import critic_node
-from app.agents.nodes import call_judge
+from app.agents.nodes import call_judge, critic_node, data_node, experiment_node
 
 np.random.seed(7)
 

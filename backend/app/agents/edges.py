@@ -1,12 +1,22 @@
+from app.agents.graph import _initial_human
+from app.agents.graph import _SYSTEM
+
+from app.agents.tools import JUDGE_TOOLS
+from app.llm.llm import load_llm
 from app.state.agent_state import AgentState
 
 
 
-def route_by_status(state: AgentState)->str:
-    current_status=state['status']
-    current_retries_count= state.get('retry_count',0)
-    max_retries= state.get('max_retries')
-    if current_status== 'retry' and current_retries_count<max_retries:
-        return 'retry' # map to name of experiment_node (change according to lokav experiment fn)
-    else:
-        return 'end'
+
+def route_after_agent(state: AgentState) -> str:
+    """tools if the agent called one; else end (it declined to act)."""
+    msgs = state.get("messages") or []
+    last = msgs[-1] if msgs else None
+    if last is not None and getattr(last, "tool_calls", None):
+        return "tools"
+    return "reporter"
+
+
+def route_after_tools(state: AgentState) -> str:
+    """Reporter once a terminal tool set a verdict; else back to the agent."""
+    return "reporter" if state.get("status") in ("accepted", "rejected") else "judge_agent"
