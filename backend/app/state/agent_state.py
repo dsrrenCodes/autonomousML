@@ -17,6 +17,8 @@ class AgentState(TypedDict):
     retry_count: int
     status: Literal["running", "retry", "accepted", "rejected", "exhausted"]
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    max_retries: int
+    report: str
 
 
 
