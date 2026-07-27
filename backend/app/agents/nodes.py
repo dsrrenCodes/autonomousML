@@ -31,6 +31,7 @@ from pydantic import BaseModel
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
+from app.artifacts import predictor_path_for_lap
 from app.state.agent_state import AgentState
 
 
@@ -251,12 +252,15 @@ def experiment_node(state: AgentState) -> AgentState:
     """
     LangGraph node entry point.
 
-    Input (from AgentState):  dataset_path, target_column, remediation
+    Input (from AgentState):  dataset_path, target_column, remediation, run_id
     Output (to AgentState):   leaderboard — list[dict], ranked best-first,
                                each entry carrying at minimum a 'model' key
                                and a 'score_val' key (Judge/Critic depend on
                                'model' specifically — the Reporter reads
                                leaderboard[0]["model"] directly).
+                              predictor_path — where THIS lap's fitted models
+                               were written, so the accepted one can be exported
+                               and downloaded once the run ends.
 
     Runs once per lap of the remediation cycle. Reads the data through
     _load_dataset(), so on a retry it refits on the REPAIRED dataset — that
@@ -271,9 +275,16 @@ def experiment_node(state: AgentState) -> AgentState:
     df = _load_dataset(state)
     target_column = state["target_column"]
 
+    # Pin where AutoGluon writes. Left unset it picks ./AutogluonModels/ag-<ts>/
+    # relative to the process cwd and nothing records the path — the models get
+    # fit, then orphaned. The lap number comes from leaderboard_history rather
+    # than retry_count because refit_and_recritique calls us BEFORE it increments
+    # retry_count, so the initial fit and the first refit would collide on lap 0.
+    lap = len(state.get("leaderboard_history") or [])
     predictor = TabularPredictor(
         label=target_column,
         verbosity=0,
+        path=predictor_path_for_lap(state.get("run_id"), lap),
     ).fit(
         TabularDataset(df),
         time_limit=60,
@@ -285,6 +296,9 @@ def experiment_node(state: AgentState) -> AgentState:
 
     return {
         "leaderboard": leaderboard,
+        # Read back off the predictor, not the path we asked for: AutoGluon
+        # normalises it (and invents one when we passed None).
+        "predictor_path": str(predictor.path),
         # Current truth for the Judge, AND one appended entry so the Reporter can
         # still quote this lap's score after a later lap overwrites `leaderboard`.
         # Top 3 only — that's all the report renders, and the full frame is heavy.
@@ -755,8 +769,13 @@ def reporter_node(state: AgentState) -> AgentState:
 
     report = {
         "status": status,
+        "run_id": state.get("run_id"),
         "verdict": decision.get("verdict"),
         "selected_model": decision.get("selected_model"),
+        # Filled in by the /audit endpoint after the graph returns — exporting a
+        # model is I/O against the artifact store, not a decision, and this node
+        # must stay renderable from a hand-built state with no run scaffold.
+        "model_artifact": None,
         "rule_based_verdict": decision.get("rule_based_verdict"),
         "overrode_rules": bool(decision.get("overrode_rules")),
         "flagged_for_manual_review": bool(decision.get("flagged_for_manual_review")),

@@ -10,6 +10,14 @@ from langgraph.graph import add_messages
 class AgentState(TypedDict):
     dataset_path: str
     target_column: str
+    # Identifies this audit's artifact directory (app/artifacts.py). Set by the
+    # /audit endpoint; absent on direct node/CLI runs, where the Experiment Node
+    # falls back to AutoGluon's default cwd behaviour.
+    run_id: str
+    # Where the LATEST lap's fitted predictor was written. LastValue, not append:
+    # the accepted model always comes from the final fit, so an earlier lap's
+    # predictor (fit on data that still had the defect) must not win.
+    predictor_path: str
     cleaned_data_summary: dict
     leaderboard: list[dict]              # AutoGluon leaderboard, ranked
     critic_findings: list[dict]          # {test, threshold, measured_value, passed}

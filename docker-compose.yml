@@ -14,6 +14,13 @@ services:
       # .venv, pyproject.toml and uv.lock into /app, and a bind mount there would
       # shadow all three and break `uv run`.
       - ./backend/app:/app/app
+      # Fitted models + the downloadable zip for each run. A named volume, not a
+      # bind mount: these are container-generated artifacts, not source. Without
+      # it they live in the writable layer and every restart silently voids the
+      # download link on any report a user still has open.
+      - audit-runs:/app/runs
+    environment:
+      - AUDIT_RUNS_DIR=/app/runs
   frontend:
     build:
       context: .
@@ -35,13 +42,7 @@ services:
       # frontend/app grows more files.
       - ./frontend/app/streamlit_app.py:/app/streamlit_app.py
 
+volumes:
+  audit-runs:
 
-# Base file: backend + frontend only. Ollama comes from OLLAMA_HOST in .env.
-#
-# Native Ollama (Mac / any host running the Ollama app):
-#   set OLLAMA_HOST=http://host.docker.internal:11434 in .env, then:
-#   docker compose up -d --build
-#
-# Containerized Ollama with NVIDIA GPU (this machine):
-#   set OLLAMA_HOST=http://ollama:11434 in .env, then:
-#   docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d --build
+
