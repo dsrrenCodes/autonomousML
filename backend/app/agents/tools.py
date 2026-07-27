@@ -18,10 +18,7 @@ from app.agents.nodes import (
     experiment_node,
 )
 
-# The refit bound (Day-0 §10): the most AutoGluon refits refit_and_recritique will
-# allow per run before it forces the agent to decide. State may override it via
-# `max_retries`; this is the fallback. Defined HERE, not in edges/graph — those
-# import tools, so importing back from them would be a circular import.
+
 MAX_RETRIES = 2
 
 
@@ -139,6 +136,9 @@ def refit_and_recritique(
     return Command(update={
         "leaderboard": exp["leaderboard"],
         "leaderboard_history": exp["leaderboard_history"],
+        # Must be forwarded, or the download would ship the PREVIOUS lap's
+        # predictor — a model fit on the data before this refit cleaned it.
+        "predictor_path": exp["predictor_path"],
         "critic_findings": crit["critic_findings"],
         "findings_history": crit["findings_history"],
         "cleaned_data_summary": exp["cleaned_data_summary"],

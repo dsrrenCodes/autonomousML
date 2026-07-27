@@ -131,6 +131,9 @@ def build_graph(entry: str = "data"):
  
     return graph.compile()
 
+
+app_graph = build_graph()
+
 if __name__ == "__main__":
     import sys
     from pathlib import Path
