@@ -69,12 +69,34 @@ def render_verdict_banner(report: dict) -> None:
         report["overrode_rules"]           -> bool  (Judge disagreed with thresholds)
         report["rule_based_verdict"]       -> "accept" | "reject"
     """
-    # TODO(human): choose the banner treatment from the report fields above.
-    # - Use st.success / st.error / st.warning to signal accept / reject / degraded.
-    # - Name the selected_model on an accept.
-    # - Surface flagged_for_manual_review and overrode_rules as st.warning callouts
-    #   (these are the "a human must look at this" signals — don't let them hide).
-    pass
+    # Manual-review / override callouts go FIRST: they must sit above the verdict
+    # so a green accept banner can never bury a "a human must sign this off" signal.
+    if report.get("flagged_for_manual_review"):
+        st.warning(
+            "⚠️ **Flagged for manual review** — the model was accepted past a failed "
+            "critic test. A human must sign this off before anything ships."
+        )
+    if report.get("overrode_rules"):
+        st.warning(
+            f"⚖️ **Judge overrode the rules.** Thresholds alone said "
+            f"`{report.get('rule_based_verdict')}`; the Judge returned "
+            f"`{report.get('verdict')}`. Read the justification before trusting this."
+        )
+
+    # The headline verdict, severity-matched to the outcome.
+    verdict = report.get("verdict")
+    if verdict == "accept":
+        model = report.get("selected_model") or "a model"
+        st.success(f"✅ **ACCEPTED** — promoting `{model}` to production.")
+    elif verdict == "reject":
+        st.error("❌ **REJECTED** — nothing was promoted.")
+    else:
+        # No verdict: the agent ran out of refits or declined to decide (status
+        # 'exhausted'). Degraded, not clean — warn rather than pretend it passed.
+        st.warning(
+            f"🟠 **NO VERDICT** — the run ended without a decision "
+            f"(status: `{report.get('status', 'unknown')}`). Nothing was promoted."
+        )
 
 
 def render_report(report: dict) -> None:
