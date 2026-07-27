@@ -1,11 +1,14 @@
-from app.agents.graph import _initial_human
-from app.agents.graph import _SYSTEM
 
-from app.agents.tools import JUDGE_TOOLS
-from app.llm.llm import load_llm
 from app.state.agent_state import AgentState
 
 
+def route_by_status(state: AgentState) -> str:
+    """
+    Router — reads state only, per LangGraph's conditional-edge rule.
+    Does NOT increment retry_count itself (can't write from a conditional
+    edge) — see prepare_retry() below for that.
+    """
+    pass
 
 
 def route_after_agent(state: AgentState) -> str:
