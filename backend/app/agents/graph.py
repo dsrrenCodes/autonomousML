@@ -2,7 +2,7 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
-
+from app.agents.edges import route_after_agent, route_after_tools
 from app.agents.nodes import (
     _load_dataset,
     critic_node,
@@ -80,4 +80,80 @@ def judge_agent(state: AgentState) -> AgentState:
     return {"messages": prelude + [ai]}
 
 def build_graph(entry: str = "data"):
-    pass #build here
+    """
+    Pipeline: data -> experiment -> critic -> judge_agent -> [route_after_agent]
+                                                    ^               |
+                                                    |               v
+                                             route_after_tools <- tools
+                                                    |
+                                                    v
+                                                reporter -> END
+ 
+    judge_agent is the ReAct loop: it either calls a tool (run_cleaning_code,
+    refit_and_recritique, accept_model, reject_run) or, if it declines to act,
+    routes straight to reporter. Tools loop back to judge_agent unless a
+    terminal tool (accept_model/reject_run) set status to accepted/rejected,
+    in which case route_after_tools sends it to reporter instead.
+    """
+    graph = StateGraph(AgentState)
+ 
+    graph.add_node("data", data_node)
+    graph.add_node("experiment", experiment_node)
+    graph.add_node("critic", critic_node)
+    graph.add_node("judge_agent", judge_agent)
+    graph.add_node("tools", ToolNode(JUDGE_TOOLS))
+    graph.add_node("reporter", reporter_node)
+ 
+    graph.add_edge(START, entry)
+    graph.add_edge("data", "experiment")
+    graph.add_edge("experiment", "critic")
+    graph.add_edge("critic", "judge_agent")
+ 
+    graph.add_conditional_edges(
+        "judge_agent",
+        route_after_agent,
+        {
+            "tools": "tools",
+            "reporter": "reporter",
+        },
+    )
+ 
+    graph.add_conditional_edges(
+        "tools",
+        route_after_tools,
+        {
+            "judge_agent": "judge_agent",
+            "reporter": "reporter",
+        },
+    )
+ 
+    graph.add_edge("reporter", END)
+ 
+    return graph.compile()
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+    app = build_graph()
+
+    DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "adversarial_suite"
+    test_path = DATA_DIR / "titanic_leakage.csv"   # <-- changed from titanic_clean_1.csv
+
+    initial_state = {
+        "dataset_path": str(test_path),
+        "target_column": "Survived",
+        "retry_count": 0,
+        "status": "running",
+        "leaderboard_candidates_checked": [],
+    }
+
+    print("Starting graph run...")
+    result = app.invoke(initial_state, config={"recursion_limit": RECURSION_LIMIT})
+
+    print("=== Graph run complete ===")
+    print(f"Final status: {result.get('status')}")
+    print(f"\n--- Report ---")
+    print(result.get("report", "(no report field)"))
