@@ -13,3 +13,9 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# AutoGluon trained models
+AutogluonModels/
+
+# Per-run audit artifacts (fitted predictors + the downloadable model zip)
+runs/

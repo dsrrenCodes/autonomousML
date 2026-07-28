@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/dockerfile
+    container_name: backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Live code. Mount the SUBDIR (/app/app), never /app itself: the image builds
+      # .venv, pyproject.toml and uv.lock into /app, and a bind mount there would
+      # shadow all three and break `uv run`.
+      - ./backend/app:/app/app
+      # Fitted models + the downloadable zip for each run. A named volume, not a
+      # bind mount: these are container-generated artifacts, not source. Without
+      # it they live in the writable layer and every restart silently voids the
+      # download link on any report a user still has open.
+      - audit-runs:/app/runs
+    environment:
+      - AUDIT_RUNS_DIR=/app/runs
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/dockerfile
+    container_name: frontend
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    environment:
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      # This dockerfile does `COPY frontend/app .`, so the code sits at /app next to
+      # .venv + pyproject.toml. Mounting ./frontend/app:/app would hide those and
+      # break `uv run`, so mount the one source file instead. Add a line here if
+      # frontend/app grows more files.
+      - ./frontend/app/streamlit_app.py:/app/streamlit_app.py
+
+volumes:
+  audit-runs:
+
+
