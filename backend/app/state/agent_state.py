@@ -31,6 +31,12 @@ class AgentState(TypedDict):
     retry_count: int #intialise this to 0 remember when doing invoke
     max_retries: int #FOR number of times to refit the model used in refit_and_recritique tool
     report: dict
+    # True once accept_model has bounced the agent back for an implausibly high
+    # score. LastValue, and deliberately one-shot: the guardrail forces ONE round
+    # of investigation, then gets out of the way. Without it a stubborn agent
+    # ping-pongs against the block until the recursion limit kills the run, which
+    # would turn a soft "look again" into a lost audit.
+    plausibility_challenged: bool
 
 
     remediation_history: Annotated[list[dict], operator.add] #recipe of cleaning steps the agent has applied

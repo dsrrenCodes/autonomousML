@@ -42,14 +42,21 @@ def _summarize_refit(findings: List[dict], leaderboard: List[dict]) -> str:
     """A compact, LLM-facing readout of the post-refit state."""
     lines = ["Refit complete. New critic findings:"]
     for f in findings:
-        mark = "PASS" if f.get("passed") else "FAIL"
+        mark = (f.get("severity") or ("pass" if f.get("passed") else "fail")).upper()
         lines.append(f"  - {f.get('test')}: {mark} "
                      f"(measured {f.get('measured_value')}, threshold {f.get('threshold')})")
     top = leaderboard[0] if leaderboard else {}
     lines.append(f"Top model now: {top.get('model')} (score_val {top.get('score_val')}).")
     fails = [f.get("test") for f in findings if not f.get("passed", True)]
+    warns = [f.get("test") for f in findings if f.get("severity") == "warn"]
     lines.append(f"Still failing: {', '.join(fails)}." if fails
                  else "All critic tests now pass.")
+    # A repair can move a metric from FAIL to just-inside the limit, which reads
+    # as success but isn't. Name it rather than letting "all tests now pass"
+    # stand as the whole story.
+    if warns:
+        lines.append(f"Still near threshold (WARN): {', '.join(warns)} — "
+                     "not clean, investigate before accepting.")
     return "\n".join(lines)
 
 
@@ -149,6 +156,53 @@ def refit_and_recritique(
     })
 
 
+# A validation score at or above this is treated as implausible on its face.
+# Chosen against the adversarial suite (ADVERSARIAL_RESULTS.md): the two cases
+# the auditor wrongly accepted scored 1.0000 and 0.9888, while the best
+# genuinely-clean case scored 0.8771. 0.99 would let the 0.9888 case through.
+IMPLAUSIBLE_SCORE = 0.98
+
+
+def _top_score(state: dict) -> float | None:
+    """The current lap's best validation score, or None if it isn't a number."""
+    board = state.get("leaderboard") or []
+    top = (board[0] if board else {}).get("score_val")
+    return top if isinstance(top, (int, float)) and top == top else None  # NaN != NaN
+
+
+def _has_investigated(state: dict) -> bool:
+    """Has the agent actually looked at this data, or is it accepting on sight?
+
+    Gates the implausible-score guardrail below: a high score is only challenged
+    when the agent reached it without doing any work.
+
+    Deliberately counts an INSPECTION, not a change. run_cleaning_code saves a
+    remediation step only when `df` actually differs, so keying off
+    remediation_history alone would bounce an agent that ran
+    `print(df.corr()[target])`, looked properly, and correctly concluded the data
+    was fine. Worse, it would pressure the agent into editing clean data to get
+    past the block — a failure the suite already caught it committing on
+    titanic_prompt_injection, where it dropped two columns from a dataset with
+    zero failing tests.
+
+    The lenient reading is still sufficient for the bug this guards: in both
+    cases the auditor wrongly accepted, it called NO tool at all before
+    accept_model. One deliberate look is the bar.
+    """
+    if state.get("remediation_history"):        # cleaned something
+        return True
+    if (state.get("retry_count") or 0) > 0:     # spent a refit
+        return True
+    # Inspection-only runs leave no remediation entry, so read the agent's own
+    # tool calls. The ToolMessages our tools emit carry no `name`, but the
+    # AIMessage that requested them does.
+    for message in state.get("messages") or []:
+        for call in (getattr(message, "tool_calls", None) or []):
+            if call.get("name") == "run_cleaning_code":
+                return True
+    return False
+
+
 @tool
 def accept_model(
     selected_model: str,
@@ -163,6 +217,31 @@ def accept_model(
     test, you MUST explain there why the failure does not block promotion (that
     de-escalation is allowed but is flagged for human sign-off).
     """
+    # Plausibility guardrail. The prompt already tells the Judge to be skeptical
+    # of unusually high scores; the suite proved that instruction alone does not
+    # hold — a model scoring a literal 1.0000 was accepted with the reasoning
+    # that 0.9406 leakage "is below the 0.95 threshold, so it's acceptable".
+    # Enforce it in code instead, mirroring _apply_override_guardrail: bounce the
+    # first attempt, and if the agent comes back insisting, let it through but
+    # flag the run for a human.
+    top = _top_score(state)
+    implausible = top is not None and top >= IMPLAUSIBLE_SCORE and not _has_investigated(state)
+
+    if implausible and not state.get("plausibility_challenged"):
+        return Command(update={
+            "plausibility_challenged": True,
+            "messages": [ToolMessage(
+                f"BLOCKED — not yet accepted. The top validation score is "
+                f"{top:.4f}, which is not plausible for real tabular data, and you "
+                f"have not inspected the dataset. A score this high almost always "
+                f"means a feature encodes the target. Investigate with "
+                f"run_cleaning_code (e.g. print the correlations against "
+                f"'{state.get('target_column')}', or check for near-duplicate "
+                f"columns), then either clean and refit, or call accept_model "
+                f"again if you can justify why the score is real.",
+                tool_call_id=tool_call_id)],
+        })
+
     findings = _findings_from(state)
     rule_verdict = _rule_based_verdict(findings)
     decision = JudgeDecision(
@@ -176,6 +255,17 @@ def accept_model(
     # Same guardrail as call_judge: accept past a hard-fail with no justification
     # reverts to reject; with justification it is flagged for manual review.
     decision = _apply_override_guardrail(decision, rule_verdict)
+
+    # Second attempt on an implausible score: the block already fired once and the
+    # agent came back anyway. Allow it — refusing outright would make a legitimately
+    # separable dataset unshippable — but never let it out as a clean accept.
+    if implausible and decision.verdict == "accept":
+        decision.flagged_for_manual_review = True
+        decision.cited_evidence = decision.cited_evidence + [
+            f"Top validation score {top:.4f} exceeds the {IMPLAUSIBLE_SCORE} "
+            "plausibility ceiling and the data was accepted without inspection."
+        ]
+
     status = "accepted" if decision.verdict == "accept" else "rejected"
     return Command(update={
         "judge_decision": decision.model_dump(),
