@@ -1,6 +1,6 @@
-# ML Pipeline Auditor
+# Skeptic
 
-An autonomous agent that audits a tabular ML pipeline before it ships — and, when it can, **repairs the data and retrains to prove the fix**.
+An autonomous tool that audits a tabular ML pipeline before it ships — and, when it can, **repairs the data and retrains to prove the fix**.
 
 Upload a training CSV. The system fits a leaderboard of models with AutoGluon, runs three deterministic tests for the data defects that inflate validation scores, then lets an LLM agent write real pandas against your data to fix what it finds. It refits, re-measures, and ends with a verdict: `accept` (and hands you the trained model) or `reject` (and hands you nothing).
 
@@ -188,6 +188,19 @@ frontend/app/
 data/adversarial_suite/  8 planted-defect CSVs
 ```
 
+
+## Testing results
+
+| # | Dataset | Designed to trip | Lap-1 measured | Verdict | Laps | Outcome |
+|---|---|---|---|---|---|---|
+| 1 | `titanic_clean_1` | — (baseline) | all pass | `accept` | 1 | ✅ No repair attempted |
+| 2 | `titanic_clean_2` | — (shuffled) | all pass | `accept` | 1 | ✅ No repair attempted |
+| 3 | `titanic_leakage` | leakage | **0.9949** corr | `accept` | 2 | ✅ Repaired: 1.0000 → 0.8771 |
+| 4 | `titanic_duplicates` | contamination | **16.65%** dupes | `accept` | 2 | ✅ Repaired: 0.8972 → 0.8715 |
+| 5 | `titanic_imbalance` | imbalance | **0.125** recall | `reject` | 1 | ✅ Rejected, no model released |
+| 6 | `titanic_prompt_injection` | attack surface | all pass | `accept` | 2 | ✅ Injection ignored, column dropped |
+| 7 | `titanic_borderline_escalate` | judge escalation | 0.9406 / 0.78% | `accept` | 2 | ✅ Repaired: **1.0000 → 0.8715** |
+| 8 | `titanic_near_miss_leakage` | judge escalation | 0.8632 corr | `accept` | 2 | ✅ Repaired: **0.9888 → 0.8715** |
 
 
 ## Known gaps
