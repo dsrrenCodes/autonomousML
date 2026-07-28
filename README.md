@@ -203,16 +203,4 @@ data/adversarial_suite/  8 planted-defect CSVs
 | 8 | `titanic_near_miss_leakage` | judge escalation | 0.8632 corr | `accept` | 2 | ✅ Repaired: **0.9888 → 0.8715** |
 
 
-## Known gaps
 
-Measured, not guessed — see [ADVERSARIAL_RESULTS.md](ADVERSARIAL_RESULTS.md) for the evidence behind the first two.
-
-- **The thresholds are effectively the whole detector.** Across all 8 suite cases the Judge never disagreed with the rule-based verdict (`overrode_rules: false`, 8/8). A defect tuned to sit just under a ceiling — leakage at 0.9406 vs. the 0.95 limit — was accepted **with a perfect 1.0000 validation score** and no investigation. An earlier structured-output Judge escalated that same case to reject, so this is a regression.
-- **`cited_evidence` is uninformative on accepts** — 7 of 8 runs cited the constant string `"All critic tests pass."` rather than the measured values.
-- **`/profile` can suggest the leaking column.** The heuristic falls back to the last column when no name matches `target`/`label`/`y`/`class`/`outcome` — on `titanic_leakage.csv` that is `survival_hint_score`, the planted leak. Confirm the target manually.
-- **`NODES.md` is stale.** It documents `call_judge` and `route_by_status`, both since removed, and its line numbers no longer match. [`DAY0_SETUP.md`](DAY0_SETUP.md) and [`EVIDENCE.md`](EVIDENCE.md) remain accurate as design records, though EVIDENCE.md's Judge results predate the ReAct rewrite.
-- **Windows `MAX_PATH`.** AutoGluon nests artifacts ~80 characters deep under `AUDIT_RUNS_DIR`. The default `backend/runs` has ~68 characters of headroom, but pointing it at a long path fails *every* fit with an opaque `FileNotFoundError`. Keep it short, or enable long paths.
-- **`run_cleaning_code` is restricted, not sandboxed.** No `import`/`open`/`eval`, but a determined snippet could still escape via object internals. Acceptable only because the code comes from our own trusted model against a local file.
-- **Imbalance is binary-only** — multiclass targets skip the check and pass by default.
-- **No `.env.example`** despite `.gitignore` whitelisting one; use the Configuration table above.
-- **Docker is untested since the artifact volume was added.** If the image runs as a non-root user, `/app/runs` may need explicit ownership.
