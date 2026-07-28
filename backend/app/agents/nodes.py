@@ -44,7 +44,15 @@ class CriticFinding(BaseModel):
     threshold: float
     measured_value: float
     passed: bool
+    # "pass" | "warn" | "fail". Derived from passed + WARN_BAND, never set by a
+    # caller. Defaults to a value derived from `passed` so the mock fixtures in
+    # app/mocks, written before severity existed, still validate.
+    severity: str = ""
     detail: str = ""                # human-readable, feeds cited_evidence
+
+    def model_post_init(self, __context) -> None:
+        if not self.severity:
+            self.severity = "pass" if self.passed else "fail"
 
 
 # ---------------------------------------------------------------------------
@@ -343,15 +351,46 @@ LEAKAGE_THRESHOLD = 0.95
 CONTAMINATION_THRESHOLD = 0.01
 IMBALANCE_THRESHOLD = 0.50
 
+# A passing measurement this close to its threshold is reported as 'warn'.
+#
+# This does NOT change the verdict — _rule_based_verdict still keys off `passed`
+# alone, so no dataset starts failing that did not fail before. What it changes
+# is VISIBILITY. The adversarial suite (ADVERSARIAL_RESULTS.md) showed the Judge
+# repairs every named FAIL and ignores abstract instructions like "be skeptical":
+# leakage measured 0.9406 against a 0.95 ceiling rendered identically to a clean
+# 0.5434, so the agent had nothing to act on and accepted a model scoring a
+# perfect 1.0000. A near-miss has to be NAMED to be actionable.
+#
+# 0.25 rather than a tighter band because the same case pairs that leakage
+# near-miss with contamination at 0.78% against a 1% ceiling — a 10% or 15% band
+# catches the first and misses the second.
+WARN_BAND = 0.25
+
 
 def _finding(test: str, threshold: float, measured_value: float,
              passed: bool, detail: str = "") -> dict:
-    """One CriticFinding as a plain dict — matches the CriticFinding model above."""
+    """One CriticFinding as a plain dict — matches the CriticFinding model above.
+
+    Severity is derived, never passed in: a caller that could set 'pass' on a
+    near-threshold measurement would defeat the point of the band.
+    """
+    measured = round(float(measured_value), 4)
+    # Symmetric distance, so this reads correctly for both ceilings (leakage,
+    # contamination — fail when too high) and floors (imbalance — fail when too
+    # low) without either check needing to know which kind it is.
+    near = passed and abs(measured - threshold) <= threshold * WARN_BAND
+    severity = "fail" if not passed else ("warn" if near else "pass")
+
+    if severity == "warn" and detail:
+        detail += (f" NEAR THRESHOLD — within {WARN_BAND:.0%} of the {threshold} "
+                   "limit. Treat this as a suspected defect, not a clean result.")
+
     return {
         "test": test,
         "threshold": threshold,
-        "measured_value": round(float(measured_value), 4),
+        "measured_value": measured,
         "passed": bool(passed),
+        "severity": severity,
         "detail": detail,
     }
 
@@ -537,6 +576,11 @@ def _apply_override_guardrail(decision: JudgeDecision, rule_verdict:str)-> Judge
 
 _VERDICT_LABEL = {"accept": "ACCEPT", "reject": "REJECT"}
 
+# WARN is bolded like FAIL, not plain like PASS: a near-threshold measurement is
+# the thing a reviewer most needs to notice and the thing a plain "PASS" row
+# actively hides.
+_SEVERITY_LABEL = {"pass": "PASS", "warn": "**WARN**", "fail": "**FAIL**"}
+
 
 def _fmt_score(value) -> str:
     """Leaderboard scores are floats, but never trust a dict you didn't build."""
@@ -656,6 +700,15 @@ def _render_markdown(r: dict) -> str:
                   "The critic findings below are the last measured state; any "
                   "repairs the agent applied are listed under Repairs Applied.", ""]
 
+    # A warn never blocks a verdict, so if it is not surfaced above the fold it
+    # reaches the reader only as one word in a table three sections down. This is
+    # the "accepted, but look closer" case.
+    if r.get("warning_tests") and r["verdict"] == "accept":
+        lines += [f"> **Near-threshold measurements:** "
+                  f"{', '.join(f'`{t}`' for t in r['warning_tests'])}. These passed, "
+                  "so they did not block the verdict — but they sit close enough to "
+                  "the limit to be worth a human look before shipping.", ""]
+
     # Above the Justification: on a repaired run this is the only place the
     # original defect still exists, and it is the reason the run mattered.
     lines += _lap_table(r)
@@ -698,7 +751,8 @@ def _render_markdown(r: dict) -> str:
         lines += ["| Test | Result | Measured | Threshold |",
                   "|------|--------|----------|-----------|"]
         for f in r["critic_findings"]:
-            mark = "PASS" if f.get("passed") else "**FAIL**"
+            mark = _SEVERITY_LABEL.get(
+                f.get("severity") or ("pass" if f.get("passed") else "fail"), "PASS")
             lines.append(f"| {f.get('test')} | {mark} | "
                          f"{f.get('measured_value')} | {f.get('threshold')} |")
         lines += [""]
@@ -782,6 +836,9 @@ def reporter_node(state: AgentState) -> AgentState:
         "justification": decision.get("justification", ""),
         "cited_evidence": decision.get("cited_evidence", []),
         "failing_tests": [f["test"] for f in findings if not f.get("passed", True)],
+        # Passing, but close enough to the threshold to be suspect. Separate from
+        # failing_tests so no existing consumer starts treating a warn as a fail.
+        "warning_tests": [f["test"] for f in findings if f.get("severity") == "warn"],
         "critic_findings": findings,
         "leaderboard_top": leaderboard[:3],
         "remediation_history": state.get("remediation_history") or [],

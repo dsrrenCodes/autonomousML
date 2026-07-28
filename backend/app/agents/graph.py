@@ -33,10 +33,21 @@ _SYSTEM = SystemMessage(
     "finish.\n\n"
     "Strategy: fix the data defects named in the FAILING critic tests, using the "
     "smallest change that works (e.g. drop a column that leaks the target). Then "
-    "refit and re-check. If every test already passes, accept the top model "
-    "immediately — do not clean data that is already clean. Class imbalance CANNOT "
-    "be fixed by cleaning — if imbalance fails, reject_run. Keep going until you "
-    "call accept_model or reject_run."
+    "refit and re-check. Class imbalance CANNOT be fixed by cleaning — if imbalance "
+    "fails, reject_run. Keep going until you call accept_model or reject_run.\n\n"
+    "Critic findings carry a severity: PASS, WARN or FAIL.\n"
+    "  - FAIL is a hard defect. Fix it, or reject.\n"
+    "  - WARN means the measurement is close enough to its threshold to be a "
+    "SUSPECTED DEFECT that the threshold alone did not catch. Do not accept a WARN "
+    "as clean. Investigate the named column with run_cleaning_code before you "
+    "decide — a defect deliberately tuned to sit just under a limit looks exactly "
+    "like this.\n"
+    "  - If every test is PASS, accept the top model immediately — do not clean "
+    "data that is already clean.\n\n"
+    "A validation score at or near 1.0 is not a success, it is a symptom. Real "
+    "tabular data rarely admits a perfect model, so treat a near-perfect "
+    "leaderboard as evidence of leakage or contamination you have not found yet, "
+    "and investigate before accepting."
 )
 
 
@@ -49,7 +60,8 @@ def _initial_human(state: AgentState) -> HumanMessage:
     leaderboard = (state.get("leaderboard") or [])[:3]
 
     findings_lines = "\n".join(
-        f"  - {f['test']}: {'PASS' if f['passed'] else 'FAIL'} "
+        f"  - {f['test']}: "
+        f"{(f.get('severity') or ('pass' if f['passed'] else 'fail')).upper()} "
         f"(measured {f['measured_value']}, threshold {f['threshold']}) — {f.get('detail', '')}"
         for f in findings
     ) or "  (none)"

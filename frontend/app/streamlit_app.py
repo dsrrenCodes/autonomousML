@@ -7,8 +7,8 @@ import pandas as pd
 load_dotenv()
 backend_url = os.getenv("BACKEND_URL", "http://localhost:8000")
 
-st.set_page_config(page_title="ML Pipeline Auditor", layout="wide")
-st.title("🔍 ML Pipeline Auditor")
+st.set_page_config(page_title="Skeptic Auditor", layout="wide")
+st.title("🔍 Skeptic Auditor")
 st.caption(
     "Upload a training CSV. The agent trains models, hunts for the data defects that "
     "inflate a leaderboard score, **repairs what it can and retrains to prove the fix**, "
@@ -138,6 +138,17 @@ def render_verdict_banner(report: dict) -> None:
             f"`{report.get('rule_based_verdict')}`; the Judge returned "
             f"`{report.get('verdict')}`. Read the justification before trusting this."
         )
+    # Passing-but-close measurements. Not a blocker, so it sits below the two
+    # hard callouts — but above the green banner, because a reviewer who reads
+    # only the verdict is exactly who needs to see it.
+    warns = report.get("warning_tests") or []
+    if warns and report.get("verdict") == "accept":
+        st.warning(
+            f"📏 **Near threshold:** {', '.join(f'`{t}`' for t in warns)} passed, but "
+            "close enough to the limit to be a suspected defect. A defect tuned to "
+            "sit just under a threshold looks exactly like this — check the detail "
+            "column below before shipping."
+        )
 
     # The headline verdict, severity-matched to the outcome.
     verdict = report.get("verdict")
@@ -232,7 +243,15 @@ def render_report(report: dict) -> None:
     findings = report.get("critic_findings", [])
     if findings:
         df = pd.DataFrame(findings)
-        df["result"] = df["passed"].map({True: "✅ PASS", False: "❌ FAIL"})
+        # Read severity, not `passed`: a near-threshold measurement passes, and
+        # showing it as a plain green tick is exactly the failure this column
+        # exists to prevent. Fall back to `passed` for reports predating severity.
+        if "severity" not in df.columns:
+            df["severity"] = df["passed"].map({True: "pass", False: "fail"})
+        df["severity"] = df["severity"].fillna(
+            df["passed"].map({True: "pass", False: "fail"}))
+        df["result"] = df["severity"].map(
+            {"pass": "✅ PASS", "warn": "⚠️ WARN", "fail": "❌ FAIL"})
         st.dataframe(
             df[["test", "result", "measured_value", "threshold", "detail"]],
             use_container_width=True,
