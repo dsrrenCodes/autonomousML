@@ -4,6 +4,11 @@ An autonomous tool that audits a tabular ML pipeline before it ships — and, wh
 
 Upload a training CSV. The system fits a leaderboard of models with AutoGluon, runs three deterministic tests for the data defects that inflate validation scores, then lets an LLM agent write real pandas against your data to fix what it finds. It refits, re-measures, and ends with a verdict: `accept` (and hands you the trained model) or `reject` (and hands you nothing).
 
+
+
+<img width="2760" height="1432" alt="skepticml_repo_cover_two_lap_delta_v4" src="https://github.com/user-attachments/assets/8917112f-26df-4fa1-a756-b5ad0c899dc1" />
+
+
 ---
 
 ## The problem this solves
