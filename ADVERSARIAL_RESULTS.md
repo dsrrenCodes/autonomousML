@@ -4,7 +4,7 @@ Every case in [`data/adversarial_suite/`](data/adversarial_suite/) run through t
 
 **Result: 8/8.** An earlier run of this same suite scored 6/8 — the two failures drove a fix, and this document records both runs so the change is auditable rather than asserted.
 
-This closes the two open items in [EVIDENCE.md](EVIDENCE.md): *"Full end-to-end graph run"* and *"Re-run the full suite through the integrated pipeline"*.
+
 
 | | |
 |---|---|
